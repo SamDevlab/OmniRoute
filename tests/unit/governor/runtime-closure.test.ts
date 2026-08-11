@@ -272,7 +272,24 @@ test("real active runtime acquires the half-open probe only for governed B dispa
   try {
     const first = await applyGovernorToAutoComboOrder(input);
     assert.equal(first.applied, true);
+    assert.equal(first.context?.activeSelected, true);
+    assert.equal(first.context?.activeApplied, true);
+    assert.equal(first.context?.originalRoute.provider, "openai");
+    assert.equal(first.context?.originalRoute.model, "gpt-4o");
+    assert.equal(first.context?.selectedRoute?.provider, "openai");
+    assert.equal(first.context?.selectedRoute?.model, "o3-mini");
+    assert.equal(first.context?.bypassReason, undefined);
+    assert.equal(first.context?.selectedDispatchCount, 0);
+    assert.equal(first.context?.fallbackDispatchCount, 0);
+    assert.equal(first.context?.fallbackAttempted, false);
+    assert.equal(first.context?.fallbackSucceeded, false);
     assert.equal(first.orderedTargets[0].executionKey, "b");
+    assert.equal(first.selectedExecutionKey, "b");
+    assert.deepEqual(
+      first.orderedTargets.map((target) => target.executionKey),
+      ["b", "a"]
+    );
+    assert.equal(new Set(first.orderedTargets.map((target) => target.executionKey)).size, 2);
     assert.equal(breaker.isHalfOpenProbeInFlight(), true);
     assert.deepEqual(first.requestOverrides, {
       reasoning_effort: "medium",

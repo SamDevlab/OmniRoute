@@ -22,6 +22,11 @@ interface PricingEvidence {
   output: number;
 }
 
+export interface GovernorPricingResolution {
+  pricing: PricingEvidence | null;
+  pricingKnown: boolean;
+}
+
 export interface AutoComboGovernorRuntimeInput {
   body: Record<string, unknown>;
   promptText?: string;
@@ -93,6 +98,37 @@ async function getPricingEvidence(
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolve only factual zero-cost evidence when the pricing catalog has no row.
+ * `classifyTier` is deliberately gated by all three signals: a free tier,
+ * explicit free-tier evidence, and zero input/output costs. Unknown or paid
+ * models therefore retain the historical unknown-pricing behavior.
+ */
+export async function resolveGovernorPricingEvidence(
+  provider: string,
+  model: string,
+  explicitPricing?: PricingEvidence | null
+): Promise<GovernorPricingResolution> {
+  const pricing =
+    explicitPricing === undefined ? await getPricingEvidence(provider, model) : explicitPricing;
+  if (pricing) return { pricing, pricingKnown: true };
+
+  try {
+    const classification = classifyTier(provider, model);
+    if (
+      classification.tier === "free" &&
+      classification.hasFreeTier === true &&
+      classification.costPer1MInput === 0 &&
+      classification.costPer1MOutput === 0
+    ) {
+      return { pricing: { input: 0, output: 0 }, pricingKnown: true };
+    }
+  } catch {
+    // Preserve fail-closed unknown pricing if tier classification is unavailable.
+  }
+  return { pricing: null, pricingKnown: false };
 }
 
 function parseTarget(target: ResolvedComboTarget): { provider: string; model: string } {
@@ -211,17 +247,18 @@ async function buildCounterfactualCandidates(
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
-    const [pricing, capabilities] = await Promise.all([
-      getPricingEvidence(provider, model),
+    const [pricingResolution, capabilities] = await Promise.all([
+      resolveGovernorPricingEvidence(provider, model),
       Promise.resolve(getResolvedModelCapabilities({ provider, model })),
     ]);
+    const pricing = pricingResolution.pricing;
     const autoCandidate = findAutoCandidate(
       routableCandidates,
       provider,
       model,
       target.connectionId ?? null
     );
-    const tier = mapPricingTier(provider, model, pricing != null);
+    const tier = mapPricingTier(provider, model, pricingResolution.pricingKnown);
     const candidate: CounterfactualCandidate = {
       provider,
       model,
