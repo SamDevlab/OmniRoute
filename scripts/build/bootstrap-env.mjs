@@ -135,6 +135,91 @@ function unquoteEnvValue(value) {
   return value.slice(1, -1);
 }
 
+function getEncryptedCredentialSample(dataDir) {
+  const dbPath = join(dataDir, "storage.sqlite");
+  if (!existsSync(dbPath)) return null;
+
+  try {
+    const Database = require("better-sqlite3");
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    try {
+      const row = db
+        .prepare(
+          `SELECT api_key, access_token, refresh_token, id_token
+             FROM provider_connections
+            WHERE api_key LIKE 'enc:v1:%'
+               OR access_token LIKE 'enc:v1:%'
+               OR refresh_token LIKE 'enc:v1:%'
+               OR id_token LIKE 'enc:v1:%'
+            LIMIT 1`
+        )
+        .get();
+      return row?.api_key || row?.access_token || row?.refresh_token || row?.id_token || null;
+    } finally {
+      db.close();
+    }
+  } catch (error) {
+    if (isNativeSqliteLoadError(error)) return null;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to inspect existing database at ${dbPath}: ${message}`);
+  }
+}
+
+function storageKeyMatchesCiphertext(secret, ciphertext) {
+  if (!secret?.trim() || !ciphertext?.startsWith("enc:v1:")) return false;
+
+  const parts = ciphertext.split(":");
+  if (parts.length < 5) return false;
+
+  try {
+    const iv = Buffer.from(parts[2], "hex");
+    const ct = Buffer.from(parts[3], "hex");
+    const tag = Buffer.from(parts[4], "hex");
+    const tryDecrypt = (derivedKey) => {
+      const decipher = createDecipheriv("aes-256-gcm", derivedKey, iv);
+      decipher.setAuthTag(tag);
+      decipher.update(ct);
+      decipher.final();
+    };
+
+    const dynamicSalt = createHash("sha256").update(secret).digest().slice(0, 16);
+    const dynamicKey = scryptSync(secret, dynamicSalt, 32);
+    try {
+      tryDecrypt(dynamicKey);
+      return true;
+    } catch {
+      const legacyKey = scryptSync(secret, "omniroute-field-encryption-v1", 32);
+      try {
+        tryDecrypt(legacyKey);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  } catch {
+    return false;
+  }
+}
+
+function recoverWindowsStorageKey(dataDir, env = process.env) {
+  if (process.platform !== "win32") return null;
+
+  const appData = env.APPDATA || join(homedir(), "AppData", "Roaming");
+  const compatibilityServerEnvPath = join(appData, "omniroute", "server.env");
+  const activeServerEnvPath = join(dataDir, "server.env");
+  if (resolve(compatibilityServerEnvPath).toLowerCase() === resolve(activeServerEnvPath).toLowerCase()) {
+    return null;
+  }
+
+  const candidate = parseEnvFile(compatibilityServerEnvPath).STORAGE_ENCRYPTION_KEY?.trim();
+  if (!candidate) return null;
+
+  const sample = getEncryptedCredentialSample(dataDir);
+  if (!sample || !storageKeyMatchesCiphertext(candidate, sample)) return null;
+
+  return candidate;
+}
+
 // ── Write a simple KEY=VALUE env file ───────────────────────────────────────
 function writeEnvFile(filePath, env) {
   const lines = [
@@ -194,17 +279,29 @@ export function bootstrapEnv({ dataDirOverride, quiet = false } = {}) {
 
   if (!merged.STORAGE_ENCRYPTION_KEY?.trim()) {
     if (hasEncryptedCredentials(dataDir)) {
-      throw new Error(
-        `Refusing to auto-generate STORAGE_ENCRYPTION_KEY: encrypted credentials already exist in ${join(
-          dataDir,
-          "storage.sqlite"
-        )}. Restore the key via ${preferredEnvPath ?? "an appropriate .env file"}, ${serverEnvPath}, or process.env.`
-      );
+      const recoveredStorageKey = recoverWindowsStorageKey(dataDir, {
+        ...preferredEnvFiltered,
+        ...processEnvFiltered,
+      });
+      if (recoveredStorageKey) {
+        merged.STORAGE_ENCRYPTION_KEY = recoveredStorageKey;
+        log(
+          "ℹ️  Recovered STORAGE_ENCRYPTION_KEY from the Windows compatibility server.env for the active encrypted database"
+        );
+      } else {
+        throw new Error(
+          `Refusing to auto-generate STORAGE_ENCRYPTION_KEY: encrypted credentials already exist in ${join(
+            dataDir,
+            "storage.sqlite"
+          )}. Restore the key via ${preferredEnvPath ?? "an appropriate .env file"}, ${serverEnvPath}, or process.env.`
+        );
+      }
+    } else {
+      persisted.STORAGE_ENCRYPTION_KEY = randomBytes(32).toString("hex");
+      merged.STORAGE_ENCRYPTION_KEY = persisted.STORAGE_ENCRYPTION_KEY;
+      needsPersist = true;
+      log("✨ STORAGE_ENCRYPTION_KEY auto-generated (first run)");
     }
-    persisted.STORAGE_ENCRYPTION_KEY = randomBytes(32).toString("hex");
-    merged.STORAGE_ENCRYPTION_KEY = persisted.STORAGE_ENCRYPTION_KEY;
-    needsPersist = true;
-    log("✨ STORAGE_ENCRYPTION_KEY auto-generated (first run)");
   }
 
   if (!merged.STORAGE_ENCRYPTION_KEY_VERSION?.trim()) {
