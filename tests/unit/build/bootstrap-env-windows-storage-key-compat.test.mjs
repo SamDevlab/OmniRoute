@@ -18,12 +18,13 @@ function encryptCredential(secret, plaintext) {
   return `enc:v1:${iv.toString("hex")}:${ciphertext.toString("hex")}:${tag.toString("hex")}`;
 }
 
-test("bootstrap recovers a matching Windows AppData storage key for an explicitly selected DATA_DIR", async () => {
+test("bootstrap recovers a matching Windows AppData storage key for an explicitly selected DATA_DIR", async (t) => {
   let Database;
   try {
     Database = require("better-sqlite3");
   } catch {
-    return test.skip("better-sqlite3 is unavailable in this runtime");
+    t.skip("better-sqlite3 is unavailable in this runtime");
+    return;
   }
 
   const root = mkdtempSync(join(tmpdir(), "omniroute-bootstrap-win-"));
@@ -86,12 +87,13 @@ test("bootstrap recovers a matching Windows AppData storage key for an explicitl
   }
 });
 
-test("bootstrap rejects a Windows AppData storage key that does not match the active encrypted database", async () => {
+test("bootstrap rejects a Windows AppData storage key that does not match the active encrypted database", async (t) => {
   let Database;
   try {
     Database = require("better-sqlite3");
   } catch {
-    return test.skip("better-sqlite3 is unavailable in this runtime");
+    t.skip("better-sqlite3 is unavailable in this runtime");
+    return;
   }
 
   const root = mkdtempSync(join(tmpdir(), "omniroute-bootstrap-win-mismatch-"));
