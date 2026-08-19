@@ -285,6 +285,9 @@ function buildManifest(options, now, runId) {
     governorMode: options.governorMode ?? "simulate",
     governorActive: options.governorActive === true,
     canaryRate: Number.isFinite(options.canaryRate) ? options.canaryRate : 0,
+    effectiveGovernorMode: options.effectiveGovernorMode ?? null,
+    governorModeMatch: options.governorModeMatch ?? null,
+    configurationFailure: options.configurationFailure ?? null,
     requestedPairs: Number.isInteger(options.requestedPairs) ? options.requestedPairs : 0,
     authoritative: options.authoritative === true,
     syntheticWorkload: options.syntheticWorkload !== false,
@@ -477,8 +480,20 @@ function uniqueValues(values) {
   return [...new Set(values.filter(Boolean))].sort();
 }
 
-function deriveFivePairGate(pairs) {
-  const firstFive = pairs.slice(0, 5);
+export function deriveFivePairGate(pairs, { requestedPairs = null, artifactWarnings = [] } = {}) {
+  const firstFive = Array.isArray(pairs) ? pairs.slice(0, 5) : [];
+  const pairsStarted = new Set(firstFive.map((pair) => pair.pairId).filter(Boolean)).size;
+  const failureClasses = [...new Set(firstFive.map((pair) => pair.failureClass).filter(Boolean))];
+  const qualityPass = firstFive.every(
+    (pair) => pair.nativeQualityPass === true && pair.governorQualityPass === true
+  );
+  const artifactIntegrity = artifactWarnings.length === 0;
+  const benchmarkInvalid = firstFive.some(
+    (pair) =>
+      ["HARNESS_FAILURE", "TARGET_MISMATCH", "ARTIFACT_CORRUPTION", "METHODOLOGY_FAILURE"].includes(
+        pair.failureClass
+      ) || pair.stopBenchmark === true
+  );
   const pass =
     firstFive.length === 5 &&
     firstFive.every(
@@ -489,10 +504,17 @@ function deriveFivePairGate(pairs) {
         pair.nativeStreamCompleted === true &&
         pair.governorStreamCompleted === true &&
         pair.governorPlanExecutable === true &&
-        pair.governorTargetIdentity === "PASS"
-    );
+        pair.governorTargetIdentity === "PASS" &&
+        pair.nativeQualityPass === true &&
+        pair.governorQualityPass === true
+    ) &&
+    artifactIntegrity;
   return {
     pass,
+    pairsRequested: requestedPairs,
+    pairsStarted,
+    pairsCompleted: firstFive.length,
+    pairsValid: firstFive.filter((pair) => pair.valid === true).length,
     pairs: firstFive.length,
     invalid: firstFive.filter((pair) => pair.valid !== true).length,
     nativeHttp: firstFive.filter((pair) => pair.nativeHttp === 200).length,
@@ -501,8 +523,19 @@ function deriveFivePairGate(pairs) {
     governorStreams: firstFive.filter((pair) => pair.governorStreamCompleted === true).length,
     governorPlans: firstFive.filter((pair) => pair.governorPlanOperationId).length,
     governorExecutable: firstFive.filter((pair) => pair.governorPlanExecutable === true).length,
+    nativeQuality: firstFive.filter((pair) => pair.nativeQualityPass === true).length,
+    governorQuality: firstFive.filter((pair) => pair.governorQualityPass === true).length,
+    quality: qualityPass ? "PASS" : "FAIL",
     identity: firstFive.every((pair) => pair.governorTargetIdentity === "PASS") ? "PASS" : "FAIL",
-    accounting: pass ? "PASS" : "FAIL",
+    accounting: firstFive.every(
+      (pair) =>
+        pair.nativeOperationId && pair.governorPlanOperationId && pair.governorArmOperationId
+    )
+      ? "PASS"
+      : "FAIL",
+    artifactIntegrity: artifactIntegrity ? "PASS" : "FAIL",
+    benchmarkInvalid,
+    failureClasses,
   };
 }
 
@@ -521,6 +554,7 @@ export function summarizeBenchmarkRun(runDirectoryOrId, { statusOverride } = {})
   const manifest = JSON.parse(readFileSync(resolve(runDirectory, "manifest.json"), "utf8"));
   const { operations, warnings } = parseOperations(runDirectory);
   const pairs = operations.filter((operation) => operation.operationType === "pair_complete");
+  const pairIds = new Set(operations.map((operation) => operation.pairId).filter(Boolean));
   const nativeArms = operations.filter((operation) => operation.operationType === "native_arm");
   const governorPlans = operations.filter(
     (operation) => operation.operationType === "governor_plan"
@@ -552,6 +586,7 @@ export function summarizeBenchmarkRun(runDirectoryOrId, { statusOverride } = {})
   const accounting = {
     pairs: pairsCompleted,
     pairsAttempted: manifest.requestedPairs,
+    pairsStarted: pairIds.size,
     nativePreflightRequests: preflightCount,
     nativeRequests: nativeArms.length,
     governorPlanningOperations: governorPlans.length,
@@ -566,19 +601,26 @@ export function summarizeBenchmarkRun(runDirectoryOrId, { statusOverride } = {})
     startedAt: manifest.startedAt,
     completedAt: manifest.completedAt || null,
     pairsAttempted: manifest.requestedPairs,
+    pairsStarted: pairIds.size,
     pairsCompleted,
     completedPairs: pairsCompleted,
     pairsValid: pairs.filter((pair) => pair.valid === true).length,
     operationsCount: operations.length,
     validOperations: operations.length,
     warnings,
-    fivePairGate: deriveFivePairGate(pairs),
+    fivePairGate: deriveFivePairGate(pairs, {
+      requestedPairs: manifest.requestedPairs,
+      artifactWarnings: warnings,
+    }),
     native,
     governor,
     pairwise,
     agreement: pairwise.agreement,
     disagreement: pairwise.disagreement,
     accounting,
+    configurationFailure: manifest.configurationFailure || null,
+    effectiveGovernorMode: manifest.effectiveGovernorMode || null,
+    governorModeMatch: manifest.governorModeMatch ?? null,
     failureClasses: uniqueValues(operations.map((operation) => operation.failureClass)),
     quality: {
       native: native.quality,

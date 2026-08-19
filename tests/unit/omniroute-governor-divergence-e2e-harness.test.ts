@@ -28,6 +28,10 @@ const harnessPath = new URL(
   import.meta.url
 );
 const harnessSource = fs.readFileSync(harnessPath, "utf8");
+const pairStateSource = fs.readFileSync(
+  new URL("../../scripts/ad-hoc/omniroute-governor-pair-state.mjs", import.meta.url),
+  "utf8"
+);
 
 test("divergence harness keeps a fixed 12-category workload and no adaptive case generation", () => {
   const workloadSource = harnessSource.match(
@@ -81,7 +85,7 @@ test("authoritative harness freezes ten cases and stops expansion on a failed fi
   assert.match(harnessSource, /gateForFivePairs/);
   assert.match(harnessSource, /FIVE_PAIR_GATE_FAILED/);
   assert.match(harnessSource, /five-pair gate=/);
-  assert.match(harnessSource, /1\.15/);
+  assert.match(pairStateSource, /1\.15/);
   assert.match(harnessSource, /planningShare/);
   assert.match(harnessSource, /authoritativeAccounting/);
   assert.match(harnessSource, /authoritative_native_target_preflight_failed/);
@@ -94,12 +98,14 @@ test("E2E harness measures Governor planning before direct execution and records
     harnessSource,
     /const planningMs = Math\.round\(performance\.now\(\) - planningStarted\);/
   );
-  assert.match(harnessSource, /governor_target_stale/);
+  assert.match(pairStateSource, /STALE_PLAN/);
   assert.match(harnessSource, /governor-e2e-direct/);
   assert.match(harnessSource, /governor_then_native/);
   assert.match(harnessSource, /native_then_governor/);
-  assert.match(harnessSource, /pair\.native\.request\?\.qualityPass === true/);
-  assert.match(harnessSource, /pair\.governor\.direct\?\.qualityPass === true/);
+  assert.match(harnessSource, /evaluatePairState/);
+  assert.match(harnessSource, /pairState\.latencyWinner/);
+  assert.match(pairStateSource, /GOVERNOR_DIRECT_MISSING/);
+  assert.match(pairStateSource, /GOVERNOR_PLAN_NON_EXECUTABLE/);
   assert.match(harnessSource, /stopReason: "e2e_calibration_failed"/);
   assert.match(harnessSource, /const latencyWinner =/);
   assert.match(harnessSource, /winnerReason/);
@@ -297,6 +303,9 @@ function appendSyntheticPair(run, pairNumber, options = {}) {
       governorPlanOperationId,
       governorPlanExecutable: true,
       governorTargetIdentity: "PASS",
+      governorArmOperationId: governorOperationId,
+      nativeQualityPass: true,
+      governorQualityPass: true,
       failureClass: null,
     });
   }

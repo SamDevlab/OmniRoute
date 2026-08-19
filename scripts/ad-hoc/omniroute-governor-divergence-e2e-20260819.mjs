@@ -6,6 +6,7 @@ import { getCallLogs } from "../../src/lib/usage/callLogs.ts";
 import { getResolvedModelCapabilities } from "../../src/lib/modelCapabilities.ts";
 import { getCircuitBreaker } from "../../src/shared/utils/circuitBreaker.ts";
 import { getModelLockoutInfo } from "../../open-sse/services/accountFallback.ts";
+import { getGovernorMode } from "../../src/shared/utils/featureFlags.ts";
 import { applyGovernorToAutoComboOrder } from "../../open-sse/governor/autoComboRuntime.ts";
 import { resolveGovernorPricingEvidence } from "../../open-sse/governor/autoComboRuntime.ts";
 import { estimateFinalInputTokens } from "../../open-sse/handlers/chatCore/contextEstimation.ts";
@@ -28,6 +29,11 @@ import {
   hashJson,
   persistBenchmarkArtifact,
 } from "./omniroute-governor-benchmark-persistence.mjs";
+import {
+  assessGovernorRuntimeReadiness,
+  classifyGovernorPlan,
+  evaluatePairState,
+} from "./omniroute-governor-pair-state.mjs";
 
 const BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://127.0.0.1:20128";
 const REQUEST_TIMEOUT_MS = Math.max(
@@ -1071,7 +1077,14 @@ async function runGovernorE2E(
       planningMs: null,
       plan: null,
       plannedTarget: null,
-      failureClass: "HARNESS_FAILURE",
+      planState: {
+        state: "NATIVE_TARGET_MISSING",
+        executable: false,
+        failureClass: "HARNESS_FAILURE",
+        failureReason: "NATIVE_TARGET_NOT_IN_CURRENT_POOL",
+        rootCause: "HARNESS_LOGIC_ERROR",
+      },
+      effectiveGovernorMode: artifactRun?.effectiveGovernorMode || getGovernorMode(),
       authoritative,
     });
     return {
@@ -1106,11 +1119,24 @@ async function runGovernorE2E(
   const planningMs = Math.round(performance.now() - planningStarted);
   const planningCompletedAt = new Date().toISOString();
   const plan = runtime.context?.plan || null;
+  const effectiveGovernorMode = artifactRun?.effectiveGovernorMode || getGovernorMode();
   const key = planTarget(plan);
   const plannedTarget = key
     ? resolvedTargetDescriptor(
         pool.targets.find((target) => targetFromResolved(target).key === key)
       )
+    : null;
+  const revalidation =
+    plan?.executable === true && key
+      ? await revalidateTarget(pool, ...key.split(/\/(.*)/s).slice(0, 2))
+      : null;
+  const planState = classifyGovernorPlan({ plan, effectiveGovernorMode, revalidation });
+  const targetDiagnostics = key
+    ? {
+        ...candidateDetails(pool, ...key.split(/\/(.*)/s).slice(0, 2)),
+        targetPresent: pool.candidates.some((candidate) => candidateKey(candidate) === key),
+        target: key,
+      }
     : null;
   const governorPlanOperationId = appendGovernorPlanOperation(artifactRun, {
     pairId,
@@ -1121,15 +1147,24 @@ async function runGovernorE2E(
     planningMs,
     plan,
     plannedTarget,
-    failureClass: !plan || !key || plan.executable !== true ? "HARNESS_FAILURE" : null,
+    planState,
+    effectiveGovernorMode,
+    targetDiagnostics,
+    revalidation,
     authoritative,
   });
-  if (!plan || !key || plan.executable !== true) {
+  if (planState.state !== "PLAN_EXECUTABLE") {
     return {
       caseId: input.id,
       valid: false,
-      reason: "governor_plan_not_executable",
-      failureClass: "HARNESS_FAILURE",
+      reason: planState.failureReason || "GOVERNOR_PLAN_NOT_EXECUTABLE",
+      failureClass: planState.failureClass,
+      failureReason: planState.failureReason,
+      rootCause: planState.rootCause,
+      pairState: planState.state,
+      stopBenchmark: planState.stopBenchmark,
+      planState,
+      effectiveGovernorMode,
       planningMs,
       planningCorrelationId,
       e2eCompletionMs: Math.round(performance.now() - started),
@@ -1137,28 +1172,11 @@ async function runGovernorE2E(
       startedAt,
       completedAt: new Date().toISOString(),
       plan,
+      revalidation,
     };
   }
   const [provider, ...modelParts] = key.split("/");
   const model = modelParts.join("/");
-  const revalidation = await revalidateTarget(pool, provider, model);
-  if (!revalidation.valid) {
-    return {
-      caseId: input.id,
-      valid: false,
-      reason: "governor_target_stale",
-      failureClass: "STALE_PLAN",
-      planningMs,
-      planningCorrelationId,
-      e2eCompletionMs: Math.round(performance.now() - started),
-      governorPlanOperationId,
-      startedAt,
-      completedAt: new Date().toISOString(),
-      plan,
-      plannedTarget,
-      revalidation,
-    };
-  }
   const direct = await request(modelForTarget(pool, provider, model), input, "governor-e2e-direct");
   const executedTarget = direct.executedTarget;
   const targetMatch = executedTarget ? (executedTarget === key ? "PASS" : "MISMATCH") : "UNKNOWN";
@@ -1207,6 +1225,12 @@ async function runGovernorE2E(
     caseId: input.id,
     valid: direct.status === 200 && direct.streamCompleted && identityFailureClass === null,
     failureClass: identityFailureClass || direct.failureClass,
+    failureReason: identityFailureClass ? identityFailureClass : direct.failureClass || null,
+    rootCause: identityFailureClass || null,
+    pairState: "GOVERNOR_ARM_COMPLETE",
+    stopBenchmark: identityFailureClass !== null,
+    planState,
+    effectiveGovernorMode,
     planningMs,
     planningCorrelationId,
     e2eCompletionMs,
@@ -1493,7 +1517,11 @@ function appendArmOperation(
   }
 ) {
   if (!run) return null;
-  const planned = operationTargetParts(plannedTarget);
+  const plannedFromPlan =
+    plan?.selectedProvider && plan?.selectedModel
+      ? normalizeTarget(plan.selectedProvider, plan.selectedModel)
+      : null;
+  const planned = operationTargetParts(plannedTarget || plannedFromPlan);
   const nativeFirst = operationTargetParts(nativeFirstTarget);
   const nativeFinal = operationTargetParts(nativeFinalTarget);
   return run.appendOperation({
@@ -1533,12 +1561,16 @@ function appendGovernorPlanOperation(
     planningMs,
     plan,
     plannedTarget,
-    failureClass,
+    planState,
+    effectiveGovernorMode,
+    targetDiagnostics,
+    revalidation,
     authoritative,
   }
 ) {
   if (!run) return null;
   const planned = operationTargetParts(plannedTarget);
+  const guardrails = revalidation?.guardrails || null;
   return run.appendOperation({
     operationType: "governor_plan",
     arm: "governor",
@@ -1555,42 +1587,56 @@ function appendGovernorPlanOperation(
     plannedModel: planned.model,
     plannedTarget: planned.target,
     plannedConnectionId: plannedTarget?.connectionId || null,
-    executable: plan?.executable === true,
+    planPresent: Boolean(plan),
+    planState: planState?.state || null,
+    executable: planState?.executable === true,
     confidence: plan?.confidence || null,
     guardrailResults: plan?.guardrailResults || null,
-    failureClass: failureClass || null,
+    unresolvedFields: plan?.unresolvedFields || [],
+    reasons: plan?.reasons || [],
+    effectiveGovernorMode: effectiveGovernorMode || null,
+    governorModeMatch: effectiveGovernorMode === "simulate",
+    targetActive: guardrails?.active ?? null,
+    targetEligible:
+      guardrails?.eligible ??
+      (targetDiagnostics?.targetPresent ? !targetDiagnostics.quotaCutoffBlocked : null),
+    targetHealthy:
+      guardrails?.healthy ??
+      (targetDiagnostics?.targetPresent ? targetDiagnostics.statusPenalty !== true : null),
+    targetCooldown: revalidation?.cooldownActive ?? null,
+    targetLockout: revalidation?.modelLockout ?? null,
+    targetExhausted: revalidation?.unavailableStatus ?? null,
+    targetCircuitAllowed: guardrails?.circuitAllowed ?? null,
+    providerCircuitState:
+      revalidation?.providerCircuitState ?? targetDiagnostics?.circuitBreakerState ?? null,
+    connectionAllowed: revalidation?.connectionEligible ?? null,
+    connectionState: revalidation?.connectionState ?? null,
+    revalidation: revalidation
+      ? {
+          valid: revalidation.valid,
+          reason: revalidation.reason,
+          guardrails,
+          cooldownActive: revalidation.cooldownActive ?? null,
+          modelLockout: revalidation.modelLockout ?? null,
+          unavailableStatus: revalidation.unavailableStatus ?? null,
+          connectionEligible: revalidation.connectionEligible ?? null,
+        }
+      : null,
+    failureClass: planState?.failureClass || null,
+    failureReason: planState?.failureReason || null,
+    rootCause: planState?.rootCause || null,
   });
 }
 
 function appendPairCompleteOperation(run, pair, input, authoritative) {
   if (!run) return null;
-  const nativeRequest = pair.native.request;
-  const governorRequest = pair.governor.direct;
-  const nativeQuality = nativeRequest?.qualityPass === true;
-  const governorQuality = governorRequest?.qualityPass === true;
-  const qualityWinner =
-    nativeQuality === governorQuality ? "tie" : nativeQuality ? "native" : "governor";
-  const nativeSuccess = nativeRequest?.status === 200 && nativeRequest?.streamCompleted === true;
-  const governorSuccess =
-    governorRequest?.status === 200 && governorRequest?.streamCompleted === true;
-  const nativeE2E = pair.native.e2eCompletionMs;
-  const governorE2E = pair.governor.e2eCompletionMs;
-  const latencyWinner =
-    Number.isFinite(nativeE2E) && Number.isFinite(governorE2E)
-      ? nativeE2E === governorE2E
-        ? "tie"
-        : nativeE2E < governorE2E
-          ? "native"
-          : "governor"
-      : "tie";
-  const winner =
-    qualityWinner !== "tie"
-      ? qualityWinner
-      : nativeSuccess !== governorSuccess
-        ? nativeSuccess
-          ? "native"
-          : "governor"
-        : latencyWinner;
+  const nativeRequest = pair.native?.request || null;
+  const governorRequest = pair.governor?.direct || null;
+  const pairState =
+    pair.pairState ||
+    evaluatePairState({ native: pair.native, governor: pair.governor, preflight: pair.preflight });
+  const pairwise = pair.pairwise || pairState;
+  const valid = pair.invalid !== true && pairState.valid === true;
   const operationId = run.appendOperation({
     operationType: "pair_complete",
     pairId: pair.pairId || "pair-" + input.id,
@@ -1600,16 +1646,19 @@ function appendPairCompleteOperation(run, pair, input, authoritative) {
     authoritative: authoritative === true,
     startedAt: pair.startedAt || new Date().toISOString(),
     completedAt: new Date().toISOString(),
-    nativeOperationId: pair.nativeOperationId || pair.native.nativeOperationId || null,
+    nativeOperationId: pair.nativeOperationId || pair.native?.nativeOperationId || null,
     governorOperationIds: {
-      plan: pair.governorPlanOperationId || pair.governor.governorPlanOperationId || null,
-      arm: pair.governorOperationId || pair.governor.governorOperationId || null,
+      plan: pair.governorPlanOperationId || pair.governor?.governorPlanOperationId || null,
+      arm: pair.governorOperationId || pair.governor?.governorOperationId || null,
     },
-    valid: pair.invalid !== true && pair.native.valid === true && pair.governor.valid === true,
-    winner: pair.pairwise?.winner || winner,
-    reason: pair.pairwise?.winnerReason || (qualityWinner !== "tie" ? "quality" : "latency"),
-    qualityWinner: pair.pairwise?.qualityWinner || qualityWinner,
-    latencyWinner: pair.pairwise?.latencyWinner || latencyWinner,
+    valid,
+    pairState: pairState.pairState,
+    structuralValid: pairState.structuralValid,
+    winner: valid ? (pairwise.winner ?? null) : null,
+    reason: valid ? (pairwise.winnerReason ?? null) : null,
+    qualityWinner: pairwise.qualityWinner ?? null,
+    successWinner: pairwise.successWinner ?? null,
+    latencyWinner: pairwise.latencyWinner ?? null,
     agreement:
       pair.agreement ??
       (pair.native.selectedTarget && pair.governor.selectedTarget
@@ -1619,11 +1668,20 @@ function appendPairCompleteOperation(run, pair, input, authoritative) {
     governorHttp: governorRequest?.status ?? null,
     nativeStreamCompleted: nativeRequest?.streamCompleted === true,
     governorStreamCompleted: governorRequest?.streamCompleted === true,
+    nativeQualityPass: nativeRequest?.qualityPass === true,
+    governorQualityPass: governorRequest?.qualityPass === true,
+    nativeQualityReason: nativeRequest?.qualityReason ?? null,
+    governorQualityReason: governorRequest?.qualityReason ?? null,
     governorPlanOperationId:
-      pair.governorPlanOperationId || pair.governor.governorPlanOperationId || null,
-    governorPlanExecutable: pair.governor.plan?.executable === true,
-    governorTargetIdentity: pair.governor.targetIdentity || null,
-    failureClass: pair.governor.failureClass || pair.native.failureClass || null,
+      pair.governorPlanOperationId || pair.governor?.governorPlanOperationId || null,
+    governorArmOperationId: pair.governorOperationId || pair.governor?.governorOperationId || null,
+    governorPlanExecutable:
+      pair.governor?.planState?.executable === true || pair.governor?.plan?.executable === true,
+    governorTargetIdentity: pair.governor?.targetIdentity || null,
+    failureClass:
+      pairState.failureClass || pair.governor?.failureClass || pair.native?.failureClass || null,
+    failureReason: pairState.failureReason || pair.governor?.failureReason || null,
+    stopBenchmark: pairState.stopBenchmark === true,
   });
   pair.pairCompleteOperationId = operationId;
   return operationId;
@@ -1723,56 +1781,9 @@ async function runAuthoritativeNativePreflight(input, { artifactRun = null } = {
   };
 }
 
-function pairLatencyWinner(native, governor) {
-  if (
-    native.qualityPass !== true ||
-    governor.qualityPass !== true ||
-    native.status !== 200 ||
-    governor.status !== 200 ||
-    native.streamCompleted !== true ||
-    governor.streamCompleted !== true
-  ) {
-    return "tie";
-  }
-  const nativeE2E = native.e2eCompletionMs;
-  const governorE2E = governor.e2eCompletionMs;
-  if (!Number.isFinite(nativeE2E) || !Number.isFinite(governorE2E)) return "tie";
-  if (nativeE2E >= governorE2E * 1.15) return "governor";
-  if (governorE2E >= nativeE2E * 1.15) return "native";
-  return "tie";
-}
-
 function buildAuthoritativePair(pairId, input, order, preflight, native, governor) {
-  const nativeSuccess = native.request?.status === 200 && native.request?.streamCompleted === true;
-  const governorSuccess =
-    governor.direct?.status === 200 && governor.direct?.streamCompleted === true;
-  const nativeQuality = native.request?.qualityPass === true;
-  const governorQuality = governor.direct?.qualityPass === true;
-  const qualityWinner =
-    nativeQuality === governorQuality ? "tie" : nativeQuality ? "native" : "governor";
-  const reliabilityWinner =
-    native.request?.streamCompleted === governor.direct?.streamCompleted
-      ? "tie"
-      : native.request?.streamCompleted
-        ? "native"
-        : "governor";
-  const latencyWinner = pairLatencyWinner(native.request, governor.direct);
-  const winner =
-    qualityWinner !== "tie"
-      ? qualityWinner
-      : nativeSuccess !== governorSuccess
-        ? nativeSuccess
-          ? "native"
-          : "governor"
-        : latencyWinner;
-  const winnerReason =
-    qualityWinner !== "tie"
-      ? "quality"
-      : nativeSuccess !== governorSuccess
-        ? "success_or_complete_stream"
-        : latencyWinner !== "tie"
-          ? "total_e2e_latency_15_percent_threshold"
-          : "tie";
+  const pairState = evaluatePairState({ native, governor, preflight });
+  const latencyWinner = pairState.latencyWinner;
   const nativeFirstTarget = native.nativeFirstTarget || preflight.nativeFirstTarget || null;
   const nativeFinalTarget =
     native.nativeFinalTarget || native.selectedTarget || preflight.nativeFinalTarget;
@@ -1797,21 +1808,22 @@ function buildAuthoritativePair(pairId, input, order, preflight, native, governo
     preflightTarget: preflight.nativeFinalTarget,
     preflightTargetMatch: preflight.nativeFinalTarget === nativeFinalTarget ? "PASS" : "MISMATCH",
     pairwise: {
-      qualityWinner,
-      reliabilityWinner,
+      qualityWinner: pairState.qualityWinner,
+      successWinner: pairState.successWinner,
+      reliabilityWinner: pairState.successWinner,
       latencyWinner,
-      winner,
-      winnerReason,
+      winner: pairState.winner,
+      winnerReason: pairState.winnerReason,
       completionDeltaMs:
         (governor.e2eCompletionMs ?? governor.direct?.latencyMs ?? null) -
         (native.e2eCompletionMs ?? native.request?.latencyMs ?? null),
     },
-    invalid:
-      native.valid !== true ||
-      governor.valid !== true ||
-      governor.targetIdentity !== "PASS" ||
-      governor.failureClass === "TARGET_MISMATCH" ||
-      governor.failureClass === "STALE_PLAN",
+    pairState: pairState.pairState,
+    structuralValid: pairState.structuralValid,
+    stopBenchmark: pairState.stopBenchmark,
+    failureClass: pairState.failureClass,
+    failureReason: pairState.failureReason,
+    invalid: pairState.valid !== true,
   };
 }
 
@@ -1886,9 +1898,9 @@ function timingAggregate(values) {
 }
 
 function authoritativeArmAggregate(pairs, side) {
-  const results = pairs.map((pair) => pair[side]);
-  const requests = results.map((result) => (side === "native" ? result.request : result.direct));
-  const e2e = results.map((result) => result.e2eCompletionMs);
+  const results = pairs.map((pair) => pair?.[side]).filter(Boolean);
+  const requests = results.map((result) => (side === "native" ? result?.request : result?.direct));
+  const e2e = results.map((result) => result?.e2eCompletionMs);
   const headers = requests.map((request) => request?.headersAtMs);
   const ttft = requests.map((request) => request?.firstContentMs);
   const completion = requests.map((request) => request?.completionMs);
@@ -1914,7 +1926,7 @@ function authoritativeArmAggregate(pairs, side) {
     fallbackCount: fallbackCounts.reduce((sum, value) => sum + value, 0),
   };
   if (side === "governor") {
-    const planning = results.map((result) => result.planningMs);
+    const planning = results.map((result) => result?.planningMs);
     const planningShare = results.map((result) =>
       Number.isFinite(result.planningMs) &&
       Number.isFinite(result.e2eCompletionMs) &&
@@ -1927,8 +1939,10 @@ function authoritativeArmAggregate(pairs, side) {
       mean: mean(planningShare),
       p50: percentile(planningShare, 0.5),
     };
-    result.plans = results.filter((result) => Boolean(result.plan)).length;
-    result.executable = results.filter((result) => result.plan?.executable === true).length;
+    result.plans = results.filter((result) => Boolean(result?.plan)).length;
+    result.executable = results.filter(
+      (result) => result?.planState?.executable === true || result?.plan?.executable === true
+    ).length;
   }
   return result;
 }
@@ -1936,8 +1950,8 @@ function authoritativeArmAggregate(pairs, side) {
 function authoritativeAccounting(pairs) {
   const rows = [];
   for (const pair of pairs) {
-    const nativeRequest = pair.native.request;
-    const governorRequest = pair.governor.direct;
+    const nativeRequest = pair.native?.request || null;
+    const governorRequest = pair.governor?.direct || null;
     rows.push({
       pairId: pair.pairId,
       caseId: pair.caseId,
@@ -1955,7 +1969,7 @@ function authoritativeAccounting(pairs) {
       operation: "planning",
       order: pair.order,
       authoritative: true,
-      planningCorrelationId: pair.governor.planningCorrelationId || null,
+      planningCorrelationId: pair.governor?.planningCorrelationId || null,
     });
     rows.push({
       pairId: pair.pairId,
@@ -1969,12 +1983,17 @@ function authoritativeAccounting(pairs) {
       requestId: governorRequest?.requestId || null,
     });
   }
+  const nativeRequests = pairs.filter((pair) => Boolean(pair.native?.request)).length;
+  const governorPlanningOperations = pairs.filter((pair) =>
+    Boolean(pair.governorPlanOperationId || pair.governor?.governorPlanOperationId)
+  ).length;
+  const governorExecutionRequests = pairs.filter((pair) => Boolean(pair.governor?.direct)).length;
   return {
     authoritativePairs: pairs.length,
-    nativeRequests: pairs.length,
-    governorPlanningOperations: pairs.length,
-    governorExecutionRequests: pairs.filter((pair) => Boolean(pair.governor.direct)).length,
-    physicalRequests: pairs.length + pairs.filter((pair) => Boolean(pair.governor.direct)).length,
+    nativeRequests,
+    governorPlanningOperations,
+    governorExecutionRequests,
+    physicalRequests: nativeRequests + governorExecutionRequests,
     rows,
   };
 }
@@ -1984,14 +2003,33 @@ function gateForFivePairs(pairs) {
   const governor = authoritativeArmAggregate(pairs, "governor");
   const accounting = authoritativeAccounting(pairs);
   const failureClasses = [
-    ...pairs.flatMap((pair) => [pair.native.failureClass, pair.governor.failureClass]),
+    ...pairs.flatMap((pair) => [
+      pair.native?.failureClass,
+      pair.governor?.failureClass,
+      pair.failureClass,
+    ]),
   ].filter(Boolean);
   const invalid = pairs.filter((pair) => pair.invalid === true).length;
-  const correlationPass = pairs.every(
+  const correlationPass =
+    pairs.length === 5 &&
+    pairs.every(
+      (pair) =>
+        Boolean(pair.native.request?.correlationId) && Boolean(pair.governor.direct?.correlationId)
+    );
+  const identityPass =
+    pairs.length === 5 && pairs.every((pair) => pair.governor?.targetIdentity === "PASS");
+  const qualityPass =
+    pairs.length === 5 &&
+    pairs.every(
+      (pair) =>
+        pair.native?.request?.qualityPass === true && pair.governor?.direct?.qualityPass === true
+    );
+  const artifactIntegrity = pairs.every(
     (pair) =>
-      Boolean(pair.native.request?.correlationId) && Boolean(pair.governor.direct?.correlationId)
+      Boolean(pair.nativeOperationId || pair.native?.nativeOperationId) &&
+      Boolean(pair.governorPlanOperationId || pair.governor?.governorPlanOperationId) &&
+      Boolean(pair.governorOperationId || pair.governor?.governorOperationId)
   );
-  const identityPass = pairs.every((pair) => pair.governor.targetIdentity === "PASS");
   const forbiddenFailures = failureClasses.filter((failureClass) =>
     [
       "HARNESS_FAILURE",
@@ -2015,10 +2053,16 @@ function gateForFivePairs(pairs) {
     accounting.physicalRequests === 10 &&
     correlationPass &&
     identityPass &&
+    qualityPass &&
+    artifactIntegrity &&
     invalid === 0 &&
     forbiddenFailures.length === 0;
   return {
     pass,
+    pairsRequested: 5,
+    pairsStarted: pairs.length,
+    pairsCompleted: pairs.length,
+    pairsValid: pairs.filter((pair) => pair.invalid !== true).length,
     pairs: pairs.length,
     nativeHttp: native.http,
     nativeStreams: native.stream,
@@ -2026,9 +2070,14 @@ function gateForFivePairs(pairs) {
     governorExecutable: governor.executable,
     governorHttp: governor.http,
     governorStreams: governor.stream,
+    nativeQuality: native.quality,
+    governorQuality: governor.quality,
+    quality: qualityPass ? "PASS" : "FAIL",
     accounting: pass ? "PASS" : "FAIL",
     identity: identityPass ? "PASS" : "FAIL",
     correlation: correlationPass ? "PASS" : "FAIL",
+    artifactIntegrity: artifactIntegrity ? "PASS" : "FAIL",
+    benchmarkInvalid: forbiddenFailures.length > 0,
     invalid,
     failureClasses,
     forbiddenFailures,
@@ -2038,14 +2087,14 @@ function gateForFivePairs(pairs) {
 function authoritativePairwise(pairs) {
   const count = (selector, value) => pairs.filter((pair) => selector(pair) === value).length;
   return {
-    governorWins: count((pair) => pair.pairwise.winner, "governor"),
-    nativeWins: count((pair) => pair.pairwise.winner, "native"),
-    ties: count((pair) => pair.pairwise.winner, "tie"),
+    governorWins: count((pair) => pair.pairwise?.winner, "governor"),
+    nativeWins: count((pair) => pair.pairwise?.winner, "native"),
+    ties: count((pair) => pair.pairwise?.winner, "tie"),
     invalid: pairs.filter((pair) => pair.invalid).length,
-    governorQualityWins: count((pair) => pair.pairwise.qualityWinner, "governor"),
-    nativeQualityWins: count((pair) => pair.pairwise.qualityWinner, "native"),
-    governorLatencyWins: count((pair) => pair.pairwise.latencyWinner, "governor"),
-    nativeLatencyWins: count((pair) => pair.pairwise.latencyWinner, "native"),
+    governorQualityWins: count((pair) => pair.pairwise?.qualityWinner, "governor"),
+    nativeQualityWins: count((pair) => pair.pairwise?.qualityWinner, "native"),
+    governorLatencyWins: count((pair) => pair.pairwise?.latencyWinner, "governor"),
+    nativeLatencyWins: count((pair) => pair.pairwise?.latencyWinner, "native"),
   };
 }
 
@@ -2143,12 +2192,22 @@ function poolSnapshot(pool) {
 }
 
 function createHarnessRun(pool, workload, requestedPairCount, authoritative) {
+  const effectiveGovernorMode = getGovernorMode();
+  const governorReadiness = assessGovernorRuntimeReadiness({
+    expectedMode: "simulate",
+    effectiveMode: effectiveGovernorMode,
+    governorActive: false,
+    canaryRate: 0,
+  });
   const run = createBenchmarkRun({
     requestedPairs: requestedPairCount,
     authoritative,
     governorMode: "simulate",
     governorActive: false,
     canaryRate: 0,
+    effectiveGovernorMode,
+    governorModeMatch: governorReadiness.ready,
+    configurationFailure: governorReadiness.ready ? null : governorReadiness.failureReason,
     runtimeBaseUrl: BASE_URL,
     poolSnapshot: poolSnapshot(pool),
     workloadHash: hashJson(workload.map(({ id, category, prompt }) => ({ id, category, prompt }))),
@@ -2162,6 +2221,13 @@ function createHarnessRun(pool, workload, requestedPairCount, authoritative) {
         })
       )
     ),
+  });
+  run.effectiveGovernorMode = effectiveGovernorMode;
+  run.governorReadiness = governorReadiness;
+  run.updateManifest({
+    effectiveGovernorMode,
+    governorModeMatch: governorReadiness.ready,
+    configurationFailure: governorReadiness.ready ? null : governorReadiness.failureReason,
   });
   activeBenchmarkRun = run;
   const handler = (signal) => {
@@ -2307,6 +2373,34 @@ if (authoritativeOnly) {
   );
   const workload = AUTHORITATIVE_WORKLOAD.slice(0, pairLimit);
   const authoritativeRun = createHarnessRun(pool, workload, pairLimit, true);
+  if (!authoritativeRun.governorReadiness.ready) {
+    authoritativeRun.updateManifest({
+      status: "FAILED",
+      stopReason: "BENCHMARK_INVALID",
+      configurationFailure: authoritativeRun.governorReadiness.failureReason,
+    });
+    outputDocument(
+      {
+        governor: "simulate / false / 0",
+        canary: 0,
+        effectiveGovernorMode: authoritativeRun.effectiveGovernorMode,
+        governorReadiness: authoritativeRun.governorReadiness,
+        pool,
+        workload,
+        preflight: [],
+        pairs: [],
+        fivePairGate: { pass: false, reason: "GOVERNOR_MODE_MISMATCH" },
+        stopReason: "BENCHMARK_INVALID",
+      },
+      {
+        persist: true,
+        kind: "authoritative",
+        artifactRun: authoritativeRun,
+        status: "FAILED",
+      }
+    );
+    process.exit(2);
+  }
   const preflight = [];
   for (const input of workload) {
     preflight.push(await runAuthoritativeNativePreflight(input, { artifactRun: authoritativeRun }));
@@ -2367,6 +2461,39 @@ if (authoritativeOnly) {
     });
     appendPairCompleteOperation(authoritativeRun, pair, workload[index], true);
     pairs.push(pair);
+    if (pair.stopBenchmark === true) {
+      authoritativeRun.updateManifest({
+        status: "FAILED",
+        stopReason: "BENCHMARK_INVALID",
+        failureClass: pair.failureClass || "HARNESS_FAILURE",
+        failureReason: pair.failureReason || null,
+      });
+      outputDocument(
+        {
+          governor: "simulate / false / 0",
+          canary: 0,
+          pool,
+          workload,
+          preflight,
+          pairs,
+          fivePairGate: gateForFivePairs(pairs.slice(0, 5)),
+          accounting: authoritativeAccounting(pairs),
+          aggregates: {
+            native: authoritativeArmAggregate(pairs, "native"),
+            governor: authoritativeArmAggregate(pairs, "governor"),
+          },
+          pairwise: authoritativePairwise(pairs),
+          stopReason: "BENCHMARK_INVALID",
+        },
+        {
+          persist: true,
+          kind: "authoritative",
+          artifactRun: authoritativeRun,
+          status: "FAILED",
+        }
+      );
+      process.exit(2);
+    }
     if (index === 4 && pairLimit > 5) {
       const fivePairGate = gateForFivePairs(pairs.slice(0, 5));
       console.error(`[AUTHORITATIVE] five-pair gate=${fivePairGate.pass ? "PASS" : "FAIL"}`);
