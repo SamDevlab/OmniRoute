@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import os from "node:os";
+import path from "node:path";
 
 import {
   accountBenchmarkOperations,
@@ -10,6 +12,10 @@ import {
   flushSseText,
   isStreamComplete,
 } from "../../scripts/ad-hoc/omniroute-shadow-benchmark-core.mjs";
+import {
+  BENCHMARK_ARTIFACT_SCHEMA_VERSION,
+  persistBenchmarkArtifact,
+} from "../../scripts/ad-hoc/omniroute-governor-benchmark-persistence.mjs";
 
 const harnessPath = new URL(
   "../../scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs",
@@ -106,6 +112,47 @@ test("E2E harness measures Governor planning before direct execution and records
   assert.match(harnessSource, /requestCorrelationId/);
   assert.match(harnessSource, /responseCorrelationId/);
   assert.match(harnessSource, /connectionIdentity/);
+  assert.match(harnessSource, /persistBenchmarkArtifact/);
+  assert.match(harnessSource, /kind: "authoritative"/);
+  assert.match(harnessSource, /kind: "calibration-recovery"/);
+});
+
+test("durable benchmark persistence retains timers, raw output, and Map state", () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-governor-artifact-"));
+  const outputPath = path.join(temporaryDirectory, "authoritative.json");
+  const result = {
+    governor: "simulate / false / 0",
+    pairs: [
+      {
+        pairId: "pair-01",
+        native: { request: { actualOutput: "native", headersAtMs: 12 } },
+        governor: { direct: { actualOutput: "governor", planningMs: 7 } },
+      },
+    ],
+    pool: { connectionState: new Map([["connection-1", { active: true }]]) },
+  };
+
+  try {
+    const persistedPath = persistBenchmarkArtifact(result, {
+      kind: "authoritative",
+      now: new Date("2026-08-19T12:34:56.000Z"),
+      outputPath,
+      pid: 1234,
+    });
+    const artifact = JSON.parse(fs.readFileSync(persistedPath, "utf8"));
+
+    assert.equal(artifact.schemaVersion, BENCHMARK_ARTIFACT_SCHEMA_VERSION);
+    assert.equal(artifact.kind, "authoritative");
+    assert.equal(artifact.persistedAt, "2026-08-19T12:34:56.000Z");
+    assert.equal(artifact.result.pairs[0].native.request.actualOutput, "native");
+    assert.equal(artifact.result.pairs[0].native.request.headersAtMs, 12);
+    assert.equal(artifact.result.pairs[0].governor.direct.planningMs, 7);
+    assert.deepEqual(artifact.result.pool.connectionState, {
+      "connection-1": { active: true },
+    });
+  } finally {
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
 });
 
 test("calibration validator passes exact output and classifies fenced code as model quality failure", () => {

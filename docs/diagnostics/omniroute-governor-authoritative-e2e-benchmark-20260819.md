@@ -239,8 +239,19 @@ latency aggregates. Governor remains `simulate / false / 0`.
 - The ten Native target preflights are excluded from pair metrics but can affect provider cache/state
 - Pricing remains incomplete and was not used in the conclusion
 
-## Exact Next Action
+## Durable artifact contract
 
-Persist the complete authoritative benchmark JSON, including per-arm timers and planning share, to
-a diagnostic artifact before the next approved run; then separately review whether another bounded
-benchmark is warranted. Do not activate canary or alter production Governor policy.
+The prior run did not retain a complete JSON artifact. The harness now persists the complete
+authoritative result before printing it, including raw per-arm output, quality reason, headers,
+first-byte/first-content timing, `doneMs`, completion timing, reader/event state, correlation IDs,
+target identity, `planningMs`, planning share, and accounting. The writer is atomic and converts
+`Map` state to JSON objects so terminal truncation cannot erase the diagnostic record.
+
+- Writer: `scripts/ad-hoc/omniroute-governor-benchmark-persistence.mjs`
+- Default directory: `docs/diagnostics/governor-e2e-artifacts/`
+- Optional destination: `OMNIROUTE_GOVERNOR_E2E_OUTPUT`
+- Artifact schema: `1`
+- Authoritative and calibration-recovery paths persist both successful and failed gate results.
+
+This persistence change was validated without executing another benchmark. The Governor remains
+`simulate / false / 0` with canary `0`; a future benchmark still requires separate approval.

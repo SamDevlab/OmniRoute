@@ -23,6 +23,7 @@ import {
   isStreamComplete,
   normalizeText,
 } from "./omniroute-shadow-benchmark-core.mjs";
+import { persistBenchmarkArtifact } from "./omniroute-governor-benchmark-persistence.mjs";
 
 const BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://127.0.0.1:20128";
 const REQUEST_TIMEOUT_MS = Math.max(
@@ -1776,7 +1777,11 @@ function calibrationRecoverySummary(pairs) {
   };
 }
 
-function outputDocument(result) {
+function outputDocument(result, { persist = false, kind = "diagnostic" } = {}) {
+  if (persist) {
+    const artifactPath = persistBenchmarkArtifact(result, { kind });
+    console.error(`[GOVERNOR] durable artifact=${artifactPath}`);
+  }
   console.log(JSON.stringify(result, null, 2));
 }
 
@@ -1823,33 +1828,39 @@ if (calibrationRecoveryOnly) {
   const byCase = new Map(decisions.map((decision) => [decision.caseId, decision]));
   const calibrationDecisions = CALIBRATION_CASES.map(({ caseId }) => byCase.get(caseId));
   if (calibrationDecisions.some((decision) => !decision?.nativeTarget)) {
-    outputDocument({
-      governor: "simulate / false / 0",
-      canary: 0,
-      calibration: [],
-      calibrationPassed: false,
-      stopReason: "calibration_native_target_unproven",
-      missingCases: CALIBRATION_CASES.filter(({ caseId }) => !byCase.get(caseId)?.nativeTarget).map(
-        ({ caseId }) => caseId
-      ),
-    });
+    outputDocument(
+      {
+        governor: "simulate / false / 0",
+        canary: 0,
+        calibration: [],
+        calibrationPassed: false,
+        stopReason: "calibration_native_target_unproven",
+        missingCases: CALIBRATION_CASES.filter(
+          ({ caseId }) => !byCase.get(caseId)?.nativeTarget
+        ).map(({ caseId }) => caseId),
+      },
+      { persist: true, kind: "calibration-recovery" }
+    );
     process.exit(2);
   }
   const calibration = await runE2E(pool, calibrationDecisions, 3);
   const summary = calibrationRecoverySummary(calibration);
-  outputDocument({
-    governor: "simulate / false / 0",
-    canary: 0,
-    pool: {
-      raw: pool.raw,
-      active: pool.active,
-      eligible: pool.eligible,
-      healthy: pool.healthy,
-      byProvider: pool.byProvider,
+  outputDocument(
+    {
+      governor: "simulate / false / 0",
+      canary: 0,
+      pool: {
+        raw: pool.raw,
+        active: pool.active,
+        eligible: pool.eligible,
+        healthy: pool.healthy,
+        byProvider: pool.byProvider,
+      },
+      calibration: compactE2E(calibration),
+      summary,
     },
-    calibration: compactE2E(calibration),
-    summary,
-  });
+    { persist: true, kind: "calibration-recovery" }
+  );
   process.exit(summary.calibrationPassed ? 0 : 2);
 }
 if (authoritativeOnly) {
@@ -1864,42 +1875,45 @@ if (authoritativeOnly) {
   }
   const missingPreflight = preflight.filter((item) => !item.nativeFinalTarget || !item.valid);
   if (missingPreflight.length > 0) {
-    outputDocument({
-      governor: "simulate / false / 0",
-      canary: 0,
-      pool: {
-        raw: pool.raw,
-        active: pool.active,
-        eligible: pool.eligible,
-        healthy: pool.healthy,
-        executable: "per-request plan; not a pool scalar",
-        byProvider: pool.byProvider,
-        snapshotAt: pool.snapshotAt,
-        breakers: pool.breakers,
-        cooldowns: pool.cooldowns,
-        lockouts: pool.lockouts,
+    outputDocument(
+      {
+        governor: "simulate / false / 0",
+        canary: 0,
+        pool: {
+          raw: pool.raw,
+          active: pool.active,
+          eligible: pool.eligible,
+          healthy: pool.healthy,
+          executable: "per-request plan; not a pool scalar",
+          byProvider: pool.byProvider,
+          snapshotAt: pool.snapshotAt,
+          breakers: pool.breakers,
+          cooldowns: pool.cooldowns,
+          lockouts: pool.lockouts,
+        },
+        workload: workload.map(
+          ({ id, category, prompt, validator, expected, expectedJson, expectedFields }) => ({
+            id,
+            category,
+            prompt,
+            validator,
+            expected: expectedJson ?? expectedFields ?? expected ?? null,
+          })
+        ),
+        preflight: preflight.map((item) => ({
+          caseId: item.caseId,
+          nativeFirstTarget: item.nativeFirstTarget,
+          nativeFinalTarget: item.nativeFinalTarget,
+          targetIdentity: item.targetIdentity,
+          valid: item.valid,
+          failureClass: item.failureClass || null,
+        })),
+        pairs: [],
+        fivePairGate: { pass: false, reason: "authoritative_native_target_preflight_failed" },
+        stopReason: "BENCHMARK_INVALID",
       },
-      workload: workload.map(
-        ({ id, category, prompt, validator, expected, expectedJson, expectedFields }) => ({
-          id,
-          category,
-          prompt,
-          validator,
-          expected: expectedJson ?? expectedFields ?? expected ?? null,
-        })
-      ),
-      preflight: preflight.map((item) => ({
-        caseId: item.caseId,
-        nativeFirstTarget: item.nativeFirstTarget,
-        nativeFinalTarget: item.nativeFinalTarget,
-        targetIdentity: item.targetIdentity,
-        valid: item.valid,
-        failureClass: item.failureClass || null,
-      })),
-      pairs: [],
-      fivePairGate: { pass: false, reason: "authoritative_native_target_preflight_failed" },
-      stopReason: "BENCHMARK_INVALID",
-    });
+      { persist: true, kind: "authoritative" }
+    );
     process.exit(2);
   }
 
@@ -1915,19 +1929,22 @@ if (authoritativeOnly) {
           native: authoritativeArmAggregate(pairs, "native"),
           governor: authoritativeArmAggregate(pairs, "governor"),
         };
-        outputDocument({
-          governor: "simulate / false / 0",
-          canary: 0,
-          pool,
-          workload,
-          preflight,
-          pairs,
-          fivePairGate,
-          accounting: authoritativeAccounting(pairs),
-          aggregates,
-          pairwise: authoritativePairwise(pairs),
-          stopReason: "FIVE_PAIR_GATE_FAILED",
-        });
+        outputDocument(
+          {
+            governor: "simulate / false / 0",
+            canary: 0,
+            pool,
+            workload,
+            preflight,
+            pairs,
+            fivePairGate,
+            accounting: authoritativeAccounting(pairs),
+            aggregates,
+            pairwise: authoritativePairwise(pairs),
+            stopReason: "FIVE_PAIR_GATE_FAILED",
+          },
+          { persist: true, kind: "authoritative" }
+        );
         process.exit(2);
       }
     }
@@ -1972,51 +1989,55 @@ if (authoritativeOnly) {
           : best
     );
   };
-  outputDocument({
-    governor: "simulate / false / 0",
-    canary: 0,
-    pool,
-    workload: workload.map(
-      ({ id, category, prompt, validator, expected, expectedJson, expectedFields }) => ({
-        id,
-        category,
-        prompt,
-        validator,
-        expected: expectedJson ?? expectedFields ?? expected ?? null,
-      })
-    ),
-    preflight,
-    pairs,
-    fivePairGate,
-    accounting,
-    aggregates,
-    speed,
-    pairwise,
-    choices: {
-      agreement: knownAgreements.filter((pair) => pair.agreement === true).length,
-      disagreement: knownAgreements.filter((pair) => pair.agreement === false).length,
-      agreementRate: knownAgreements.length
-        ? knownAgreements.filter((pair) => pair.agreement === true).length / knownAgreements.length
-        : null,
-      native: nativeChoices,
-      governor: governorChoices,
-      governorConcentration: pairs.length
-        ? Math.max(...Object.values(governorChoices), 0) / pairs.length
-        : null,
+  outputDocument(
+    {
+      governor: "simulate / false / 0",
+      canary: 0,
+      pool,
+      workload: workload.map(
+        ({ id, category, prompt, validator, expected, expectedJson, expectedFields }) => ({
+          id,
+          category,
+          prompt,
+          validator,
+          expected: expectedJson ?? expectedFields ?? expected ?? null,
+        })
+      ),
+      preflight,
+      pairs,
+      fivePairGate,
+      accounting,
+      aggregates,
+      speed,
+      pairwise,
+      choices: {
+        agreement: knownAgreements.filter((pair) => pair.agreement === true).length,
+        disagreement: knownAgreements.filter((pair) => pair.agreement === false).length,
+        agreementRate: knownAgreements.length
+          ? knownAgreements.filter((pair) => pair.agreement === true).length /
+            knownAgreements.length
+          : null,
+        native: nativeChoices,
+        governor: governorChoices,
+        governorConcentration: pairs.length
+          ? Math.max(...Object.values(governorChoices), 0) / pairs.length
+          : null,
+      },
+      outliers: {
+        nativeSlowest: outlier("native", "slowest"),
+        nativeFastest: outlier("native", "fastest"),
+        governorSlowest: outlier("governor", "slowest"),
+        governorFastest: outlier("governor", "fastest"),
+      },
+      conclusion: fivePairGate.pass
+        ? authoritativeConclusion(pairs, aggregates, pairwise)
+        : "E2E_INCONCLUSIVE",
+      cost: "INCOMPLETE",
+      decisionBenchmark: "INCONCLUSIVE",
+      canaryReadiness: "NOT_READY",
     },
-    outliers: {
-      nativeSlowest: outlier("native", "slowest"),
-      nativeFastest: outlier("native", "fastest"),
-      governorSlowest: outlier("governor", "slowest"),
-      governorFastest: outlier("governor", "fastest"),
-    },
-    conclusion: fivePairGate.pass
-      ? authoritativeConclusion(pairs, aggregates, pairwise)
-      : "E2E_INCONCLUSIVE",
-    cost: "INCOMPLETE",
-    decisionBenchmark: "INCONCLUSIVE",
-    canaryReadiness: "NOT_READY",
-  });
+    { persist: true, kind: "authoritative" }
+  );
   process.exit(fivePairGate.pass ? 0 : 2);
 }
 if (e2eReplayOnly) {
