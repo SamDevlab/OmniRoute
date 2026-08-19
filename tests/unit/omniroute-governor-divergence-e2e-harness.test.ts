@@ -88,7 +88,7 @@ test("authoritative harness freezes ten cases and stops expansion on a failed fi
   assert.match(pairStateSource, /1\.15/);
   assert.match(harnessSource, /planningShare/);
   assert.match(harnessSource, /authoritativeAccounting/);
-  assert.match(harnessSource, /authoritative_native_target_preflight_failed/);
+  assert.match(harnessSource, /native_baseline_resolution_failed/);
 });
 
 test("E2E harness measures Governor planning before direct execution and records stale skips", () => {
@@ -126,7 +126,14 @@ test("E2E harness measures Governor planning before direct execution and records
   assert.match(harnessSource, /connectionIdentity/);
   assert.match(harnessSource, /persistBenchmarkArtifact/);
   assert.match(harnessSource, /createBenchmarkRun/);
-  assert.match(harnessSource, /native_preflight/);
+  assert.match(harnessSource, /native_baseline_resolution/);
+  assert.match(harnessSource, /resolveNativeBaselineWithoutExecution/);
+  assert.match(harnessSource, /nativeBaselineTarget/);
+  assert.match(harnessSource, /nativeFirstActualTarget/);
+  assert.match(harnessSource, /nativeFinalActualTarget/);
+  assert.match(harnessSource, /baselineSnapshotId/);
+  assert.match(harnessSource, /nativeBaselineResolution: "side_effect_free"/);
+  assert.doesNotMatch(harnessSource, /runAuthoritativeNativePreflight/);
   assert.match(harnessSource, /governor_plan/);
   assert.match(harnessSource, /governor_arm/);
   assert.match(harnessSource, /pair_complete/);

@@ -8,7 +8,6 @@ import { getCircuitBreaker } from "../../src/shared/utils/circuitBreaker.ts";
 import { getModelLockoutInfo } from "../../open-sse/services/accountFallback.ts";
 import { getGovernorMode } from "../../src/shared/utils/featureFlags.ts";
 import { applyGovernorToAutoComboOrder } from "../../open-sse/governor/autoComboRuntime.ts";
-import { resolveGovernorPricingEvidence } from "../../open-sse/governor/autoComboRuntime.ts";
 import { estimateFinalInputTokens } from "../../open-sse/handlers/chatCore/contextEstimation.ts";
 import { buildAutoCandidates } from "../../open-sse/services/combo.ts";
 import { scoreAutoTargets } from "../../open-sse/services/combo/autoStrategy.ts";
@@ -34,6 +33,12 @@ import {
   classifyGovernorPlan,
   evaluatePairState,
 } from "./omniroute-governor-pair-state.mjs";
+import {
+  createNativeBaselineSnapshot,
+  nativeBaselineRequest,
+  nativeBaselineStateDigest,
+  resolveNativeBaselineWithoutExecution,
+} from "./omniroute-governor-native-baseline.mjs";
 
 const BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://127.0.0.1:20128";
 const REQUEST_TIMEOUT_MS = Math.max(
@@ -681,7 +686,6 @@ async function buildPool() {
         provider: candidate.provider,
         model: candidate.model,
       });
-      const pricing = await resolveGovernorPricingEvidence(candidate.provider, candidate.model);
       const score = scored.find(
         (entry) => candidateKey(candidate) === targetFromResolved(entry.target).key
       );
@@ -696,7 +700,6 @@ async function buildPool() {
           vision: capabilities.supportsVision === true,
           reasoning: capabilities.reasoning ?? null,
         },
-        pricing: pricing.pricingKnown ? "known" : "unknown",
         tier: classifyTier(candidate.provider, candidate.model).tier || null,
         latencyP95Ms: finite(candidate.p95LatencyMs),
         reliabilityObserved: candidate.reliabilityObserved ?? null,
@@ -1254,7 +1257,16 @@ async function runGovernorE2E(
 
 async function runNativeE2E(
   input,
-  { artifactRun = null, pairId = null, order = null, authoritative = false } = {}
+  {
+    artifactRun = null,
+    pairId = null,
+    order = null,
+    authoritative = false,
+    nativeBaselineTarget = null,
+    nativeBaselineConnection = null,
+    baselineSnapshotId = null,
+    baselineSnapshotHash = null,
+  } = {}
 ) {
   const started = performance.now();
   const startedAt = new Date().toISOString();
@@ -1292,6 +1304,15 @@ async function runNativeE2E(
     completedAt: requestResult.completedAt || new Date().toISOString(),
     nativeFirstTarget,
     nativeFinalTarget,
+    nativeBaselineTarget,
+    nativeBaselineConnection,
+    nativeBaselineResolution: nativeBaselineTarget ? "side_effect_free" : null,
+    baselineSnapshotId,
+    baselineSnapshotHash,
+    baselineDrift:
+      nativeBaselineTarget && nativeFirstTarget ? nativeBaselineTarget !== nativeFirstTarget : null,
+    nativeFallback:
+      nativeFirstTarget && nativeFinalTarget ? nativeFirstTarget !== nativeFinalTarget : null,
     authoritative,
   });
   return {
@@ -1314,6 +1335,26 @@ async function runNativeE2E(
     selectedTarget: observedTarget,
     nativeFirstTarget,
     nativeFinalTarget,
+    nativeBaselineTarget,
+    baselineNativeTarget: nativeBaselineTarget,
+    nativeFirstActualTarget: nativeFirstTarget,
+    nativeFinalActualTarget: nativeFinalTarget,
+    baselineVsFirstActual:
+      nativeBaselineTarget && nativeFirstTarget
+        ? nativeBaselineTarget === nativeFirstTarget
+          ? "PASS"
+          : "MISMATCH"
+        : "UNKNOWN",
+    baselineVsFinalActual:
+      nativeBaselineTarget && nativeFinalTarget
+        ? nativeBaselineTarget === nativeFinalTarget
+          ? "PASS"
+          : "MISMATCH"
+        : "UNKNOWN",
+    baselineDrift:
+      nativeBaselineTarget && nativeFirstTarget && nativeBaselineTarget !== nativeFirstTarget,
+    nativeFallback:
+      nativeFirstTarget && nativeFinalTarget && nativeFirstTarget !== nativeFinalTarget,
     executedTarget,
     executedConnectionId: requestResult.executedConnectionId,
     targetIdentity,
@@ -1511,17 +1552,20 @@ function appendArmOperation(
     plannedTarget,
     nativeFirstTarget,
     nativeFinalTarget,
+    nativeBaselineTarget,
+    nativeBaselineConnection,
+    nativeBaselineResolution,
+    baselineSnapshotId,
+    baselineSnapshotHash,
+    baselineDrift,
+    nativeFallback,
     planningMs,
     planningShare,
     authoritative,
   }
 ) {
   if (!run) return null;
-  const plannedFromPlan =
-    plan?.selectedProvider && plan?.selectedModel
-      ? normalizeTarget(plan.selectedProvider, plan.selectedModel)
-      : null;
-  const planned = operationTargetParts(plannedTarget || plannedFromPlan);
+  const planned = operationTargetParts(plannedTarget);
   const nativeFirst = operationTargetParts(nativeFirstTarget);
   const nativeFinal = operationTargetParts(nativeFinalTarget);
   return run.appendOperation({
@@ -1545,6 +1589,17 @@ function appendArmOperation(
     nativeFinalProvider: nativeFinal.provider,
     nativeFinalModel: nativeFinal.model,
     nativeFinalTarget: nativeFinal.target,
+    nativeFirstActualTarget: nativeFirst.target,
+    nativeFinalActualTarget: nativeFinal.target,
+    nativeBaselineProvider: operationTargetParts(nativeBaselineTarget).provider,
+    nativeBaselineModel: operationTargetParts(nativeBaselineTarget).model,
+    nativeBaselineTarget: operationTargetParts(nativeBaselineTarget).target,
+    nativeBaselineConnection: nativeBaselineConnection || plannedTarget?.connectionId || null,
+    nativeBaselineResolution: nativeBaselineResolution || null,
+    baselineSnapshotId: baselineSnapshotId || null,
+    baselineSnapshotHash: baselineSnapshotHash || null,
+    baselineDrift: baselineDrift ?? null,
+    nativeFallback: nativeFallback ?? null,
     planningMs: planningMs ?? null,
     planningShare: planningShare ?? null,
   });
@@ -1634,7 +1689,7 @@ function appendPairCompleteOperation(run, pair, input, authoritative) {
   const governorRequest = pair.governor?.direct || null;
   const pairState =
     pair.pairState ||
-    evaluatePairState({ native: pair.native, governor: pair.governor, preflight: pair.preflight });
+    evaluatePairState({ native: pair.native, governor: pair.governor, baseline: pair.baseline });
   const pairwise = pair.pairwise || pairState;
   const valid = pair.invalid !== true && pairState.valid === true;
   const operationId = run.appendOperation({
@@ -1675,6 +1730,14 @@ function appendPairCompleteOperation(run, pair, input, authoritative) {
     governorPlanOperationId:
       pair.governorPlanOperationId || pair.governor?.governorPlanOperationId || null,
     governorArmOperationId: pair.governorOperationId || pair.governor?.governorOperationId || null,
+    nativeBaselineOperationId: pair.nativeBaselineOperationId || null,
+    nativeBaselineTarget: pair.nativeBaselineTarget || null,
+    nativeFirstActualTarget: pair.nativeFirstActualTarget || null,
+    nativeFinalActualTarget: pair.nativeFinalActualTarget || null,
+    baselineVsFirstActual: pair.baselineVsFirstActual || null,
+    baselineVsFinalActual: pair.baselineVsFinalActual || null,
+    baselineDrift: pair.baselineDrift || null,
+    nativeFallback: pair.nativeFallback || null,
     governorPlanExecutable:
       pair.governor?.planState?.executable === true || pair.governor?.plan?.executable === true,
     governorTargetIdentity: pair.governor?.targetIdentity || null,
@@ -1729,67 +1792,83 @@ function compactE2E(pairs) {
   });
 }
 
-async function runAuthoritativeNativePreflight(input, { artifactRun = null } = {}) {
-  const requestResult = await request("auto/chat", input, "authoritative-target-preflight");
-  const plan = await readGovernorPlan(requestResult.correlationId);
-  const observedTarget =
-    plan?.actualProvider && plan?.actualModel
-      ? normalizeTarget(plan.actualProvider, plan.actualModel)
-      : requestResult.responseModel
-        ? normalizeTarget(
-            parseModel(requestResult.responseModel).provider || "unknown",
-            parseModel(requestResult.responseModel).model || requestResult.responseModel
-          )
-        : null;
-  const finalTarget = requestResult.executedTarget || observedTarget;
-  const firstTarget = requestResult.fallbackAttempts === 0 ? observedTarget : null;
-  const targetIdentity =
-    observedTarget && requestResult.executedTarget
-      ? observedTarget === requestResult.executedTarget
-        ? "PASS"
-        : "MISMATCH"
-      : "UNKNOWN";
-  const nativePreflightOperationId = appendArmOperation(artifactRun, {
-    operationType: "native_preflight",
+async function resolveAuthoritativeNativeBaseline(input, snapshot, { artifactRun = null } = {}) {
+  const resolution = resolveNativeBaselineWithoutExecution({
+    snapshot,
+    request: nativeBaselineRequest(input.id, input.prompt),
+  });
+  const baselineTarget = resolution.nativeBaselineTarget || null;
+  const baselineOperationId = artifactRun?.appendOperation({
+    operationType: "native_baseline_resolution",
     arm: "native",
     caseId: input.id,
     category: input.category,
-    request: requestResult,
-    totalE2EMs: null,
-    startedAt: requestResult.startedAt,
-    completedAt: requestResult.completedAt,
-    nativeFirstTarget: firstTarget,
-    nativeFinalTarget: finalTarget,
+    order: null,
     authoritative: true,
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    nativeBaselineProvider: resolution.nativeBaselineProvider || null,
+    nativeBaselineModel: resolution.nativeBaselineModel || null,
+    nativeBaselineConnection: resolution.nativeBaselineConnection || null,
+    nativeBaselineTarget: baselineTarget,
+    nativeBaselineResolution: "side_effect_free",
+    baselineSnapshotId: resolution.baselineSnapshotId,
+    baselineSnapshotHash: resolution.baselineSnapshotHash,
+    nativeBaselineCandidateOrder: resolution.nativeBaselineCandidateOrder || [],
+    nativeBaselineCandidateCount: resolution.nativeBaselineCandidateCount || 0,
+    nativeBaselineSelection: resolution.nativeBaselineSelection,
+    providerModelRequests: 0,
+    governorProviderModelPreflightRequests: 0,
+    networkCalls: resolution.networkCalls,
+    routingStateMutation: false,
+    homeStateDigestBefore: nativeBaselineStateDigest(snapshot),
+    homeStateDigestAfter: nativeBaselineStateDigest(snapshot),
+    valid: resolution.valid === true,
+    failureClass: resolution.valid ? null : "NATIVE_BASELINE_RESOLUTION_FAILED",
+    failureReason: resolution.error || null,
   });
   return {
     caseId: input.id,
-    nativeFirstTarget: firstTarget,
-    nativeFinalTarget: finalTarget,
-    observedTarget,
-    targetIdentity,
-    valid: requestResult.status === 200 && requestResult.streamCompleted && Boolean(finalTarget),
-    failureClass:
-      targetIdentity === "MISMATCH"
-        ? "TARGET_MISMATCH"
-        : targetIdentity === "UNKNOWN"
-          ? "HARNESS_FAILURE"
-          : requestResult.failureClass,
-    request: requestResult,
-    plan,
-    nativePreflightOperationId,
+    nativeBaselineTarget: baselineTarget,
+    nativeBaselineProvider: resolution.nativeBaselineProvider || null,
+    nativeBaselineModel: resolution.nativeBaselineModel || null,
+    nativeBaselineConnection: resolution.nativeBaselineConnection || null,
+    nativeBaselineResolution: "side_effect_free",
+    baselineSnapshotId: resolution.baselineSnapshotId,
+    baselineSnapshotHash: resolution.baselineSnapshotHash,
+    nativeBaselineCandidateOrder: resolution.nativeBaselineCandidateOrder || [],
+    nativeBaselineCandidateCount: resolution.nativeBaselineCandidateCount || 0,
+    providerModelRequests: 0,
+    networkCalls: resolution.networkCalls,
+    routingStateMutation: false,
+    homeStateDigestBefore: nativeBaselineStateDigest(snapshot),
+    homeStateDigestAfter: nativeBaselineStateDigest(snapshot),
+    valid: resolution.valid === true && Boolean(baselineTarget),
+    failureClass: resolution.valid ? null : "NATIVE_BASELINE_RESOLUTION_FAILED",
+    failureReason: resolution.error || null,
+    baselineOperationId,
   };
 }
 
-function buildAuthoritativePair(pairId, input, order, preflight, native, governor) {
-  const pairState = evaluatePairState({ native, governor, preflight });
+function buildAuthoritativePair(pairId, input, order, baseline, native, governor) {
+  const pairState = evaluatePairState({ native, governor, baseline });
   const latencyWinner = pairState.latencyWinner;
-  const nativeFirstTarget = native.nativeFirstTarget || preflight.nativeFirstTarget || null;
-  const nativeFinalTarget =
-    native.nativeFinalTarget || native.selectedTarget || preflight.nativeFinalTarget;
+  const nativeBaselineTarget = baseline.nativeBaselineTarget || null;
+  const nativeFirstActualTarget =
+    native.nativeFirstActualTarget || native.nativeFirstTarget || null;
+  const nativeFinalActualTarget =
+    native.nativeFinalActualTarget || native.nativeFinalTarget || native.selectedTarget || null;
   const governorTarget = governor.selectedTarget || null;
   const agreement =
-    nativeFirstTarget && governorTarget ? nativeFirstTarget === governorTarget : null;
+    nativeBaselineTarget && governorTarget ? nativeBaselineTarget === governorTarget : null;
+  const baselineDrift =
+    nativeBaselineTarget && nativeFirstActualTarget
+      ? nativeBaselineTarget !== nativeFirstActualTarget
+      : null;
+  const nativeFallback =
+    nativeFirstActualTarget && nativeFinalActualTarget
+      ? nativeFirstActualTarget !== nativeFinalActualTarget
+      : null;
   return {
     pairId,
     caseId: input.id,
@@ -1801,12 +1880,25 @@ function buildAuthoritativePair(pairId, input, order, preflight, native, governo
     authoritative: true,
     native,
     governor,
-    nativeFirstTarget,
-    nativeFinalTarget,
+    baseline,
+    nativeBaselineTarget,
+    baselineNativeTarget: nativeBaselineTarget,
+    nativeFirstActualTarget,
+    nativeFinalActualTarget,
+    nativeFirstTarget: nativeFirstActualTarget,
+    nativeFinalTarget: nativeFinalActualTarget,
+    baselineVsFirstActual: baselineDrift === null ? "UNKNOWN" : baselineDrift ? "MISMATCH" : "PASS",
+    baselineVsFinalActual:
+      nativeBaselineTarget && nativeFinalActualTarget
+        ? nativeBaselineTarget === nativeFinalActualTarget
+          ? "PASS"
+          : "MISMATCH"
+        : "UNKNOWN",
+    baselineDrift,
+    nativeFallback,
+    nativeBaselineOperationId: baseline.baselineOperationId || null,
     governorSelectedTarget: governorTarget,
     agreement,
-    preflightTarget: preflight.nativeFinalTarget,
-    preflightTargetMatch: preflight.nativeFinalTarget === nativeFinalTarget ? "PASS" : "MISMATCH",
     pairwise: {
       qualityWinner: pairState.qualityWinner,
       successWinner: pairState.successWinner,
@@ -1827,14 +1919,8 @@ function buildAuthoritativePair(pairId, input, order, preflight, native, governo
   };
 }
 
-async function runAuthoritativePair(
-  pool,
-  input,
-  preflight,
-  pairIndex,
-  { artifactRun = null } = {}
-) {
-  const nativeKey = preflight.nativeFinalTarget || preflight.nativeFirstTarget;
+async function runAuthoritativePair(pool, input, baseline, pairIndex, { artifactRun = null } = {}) {
+  const nativeKey = baseline.nativeBaselineTarget;
   if (!nativeKey) {
     return {
       pairId: `pair-${String(pairIndex + 1).padStart(2, "0")}`,
@@ -1843,7 +1929,7 @@ async function runAuthoritativePair(
       order: pairIndex % 2 === 1 ? "governor_then_native" : "native_then_governor",
       authoritative: true,
       invalid: true,
-      preflightTarget: null,
+      nativeBaselineTarget: null,
       native: { valid: false, failureClass: "HARNESS_FAILURE" },
       governor: { valid: false, failureClass: "HARNESS_FAILURE" },
     };
@@ -1864,12 +1950,16 @@ async function runAuthoritativePair(
       pairId,
       order,
       authoritative: true,
+      nativeBaselineTarget: baseline.nativeBaselineTarget,
+      nativeBaselineConnection: baseline.nativeBaselineConnection,
+      baselineSnapshotId: baseline.baselineSnapshotId,
+      baselineSnapshotHash: baseline.baselineSnapshotHash,
     });
   const first = governorFirst ? await governorPromise() : await nativePromise();
   const second = governorFirst ? await nativePromise() : await governorPromise();
   const native = governorFirst ? second : first;
   const governor = governorFirst ? first : second;
-  return buildAuthoritativePair(pairId, input, order, preflight, native, governor);
+  return buildAuthoritativePair(pairId, input, order, baseline, native, governor);
 }
 
 function percentile(values, fraction) {
@@ -1984,12 +2074,18 @@ function authoritativeAccounting(pairs) {
     });
   }
   const nativeRequests = pairs.filter((pair) => Boolean(pair.native?.request)).length;
+  const nativeBaselineResolutions = pairs.filter((pair) =>
+    Boolean(pair.nativeBaselineOperationId || pair.baseline?.baselineOperationId)
+  ).length;
   const governorPlanningOperations = pairs.filter((pair) =>
     Boolean(pair.governorPlanOperationId || pair.governor?.governorPlanOperationId)
   ).length;
   const governorExecutionRequests = pairs.filter((pair) => Boolean(pair.governor?.direct)).length;
   return {
     authoritativePairs: pairs.length,
+    nativeBaselineResolutions,
+    nativeBaselineProviderModelRequests: 0,
+    governorProviderModelPreflightRequests: 0,
     nativeRequests,
     governorPlanningOperations,
     governorExecutionRequests,
@@ -2373,6 +2469,16 @@ if (authoritativeOnly) {
   );
   const workload = AUTHORITATIVE_WORKLOAD.slice(0, pairLimit);
   const authoritativeRun = createHarnessRun(pool, workload, pairLimit, true);
+  const baselineSnapshot = await createNativeBaselineSnapshot({ pool });
+  authoritativeRun.updateManifest({
+    nativeBaselineResolution: "side_effect_free",
+    baselineSnapshotId: baselineSnapshot.snapshotId,
+    baselineSnapshotHash: baselineSnapshot.baselineSnapshotHash,
+    nativeBaselineProviderModelRequests: 0,
+    governorProviderModelPreflightRequests: 0,
+    sideEffectFreeBaselineResolutions: 0,
+    preflightStateContamination: "PENDING",
+  });
   if (!authoritativeRun.governorReadiness.ready) {
     authoritativeRun.updateManifest({
       status: "FAILED",
@@ -2387,7 +2493,7 @@ if (authoritativeOnly) {
         governorReadiness: authoritativeRun.governorReadiness,
         pool,
         workload,
-        preflight: [],
+        nativeBaseline: [],
         pairs: [],
         fivePairGate: { pass: false, reason: "GOVERNOR_MODE_MISMATCH" },
         stopReason: "BENCHMARK_INVALID",
@@ -2401,12 +2507,37 @@ if (authoritativeOnly) {
     );
     process.exit(2);
   }
-  const preflight = [];
+  const nativeBaseline = [];
   for (const input of workload) {
-    preflight.push(await runAuthoritativeNativePreflight(input, { artifactRun: authoritativeRun }));
+    nativeBaseline.push(
+      await resolveAuthoritativeNativeBaseline(input, baselineSnapshot, {
+        artifactRun: authoritativeRun,
+      })
+    );
   }
-  const missingPreflight = preflight.filter((item) => !item.nativeFinalTarget || !item.valid);
-  if (missingPreflight.length > 0) {
+  authoritativeRun.updateManifest({
+    sideEffectFreeBaselineResolutions: nativeBaseline.length,
+    preflightStateContamination: nativeBaseline.every(
+      (item) =>
+        item.valid === true &&
+        item.networkCalls === 0 &&
+        item.providerModelRequests === 0 &&
+        item.routingStateMutation === false &&
+        item.homeStateDigestBefore === item.homeStateDigestAfter
+    )
+      ? "NO"
+      : "YES",
+  });
+  const missingBaseline = nativeBaseline.filter(
+    (item) =>
+      !item.nativeBaselineTarget ||
+      !item.valid ||
+      item.networkCalls !== 0 ||
+      item.providerModelRequests !== 0 ||
+      item.routingStateMutation !== false ||
+      item.homeStateDigestBefore !== item.homeStateDigestAfter
+  );
+  if (missingBaseline.length > 0) {
     outputDocument(
       {
         governor: "simulate / false / 0",
@@ -2432,16 +2563,25 @@ if (authoritativeOnly) {
             expected: expectedJson ?? expectedFields ?? expected ?? null,
           })
         ),
-        preflight: preflight.map((item) => ({
+        nativeBaseline: nativeBaseline.map((item) => ({
           caseId: item.caseId,
-          nativeFirstTarget: item.nativeFirstTarget,
-          nativeFinalTarget: item.nativeFinalTarget,
-          targetIdentity: item.targetIdentity,
+          nativeBaselineTarget: item.nativeBaselineTarget,
+          nativeBaselineProvider: item.nativeBaselineProvider,
+          nativeBaselineModel: item.nativeBaselineModel,
+          nativeBaselineConnection: item.nativeBaselineConnection,
+          nativeBaselineResolution: item.nativeBaselineResolution,
+          baselineSnapshotId: item.baselineSnapshotId,
+          baselineSnapshotHash: item.baselineSnapshotHash,
+          networkCalls: item.networkCalls,
+          providerModelRequests: item.providerModelRequests,
+          routingStateMutation: item.routingStateMutation,
+          homeStateDigestBefore: item.homeStateDigestBefore,
+          homeStateDigestAfter: item.homeStateDigestAfter,
           valid: item.valid,
           failureClass: item.failureClass || null,
         })),
         pairs: [],
-        fivePairGate: { pass: false, reason: "authoritative_native_target_preflight_failed" },
+        fivePairGate: { pass: false, reason: "native_baseline_resolution_failed" },
         stopReason: "BENCHMARK_INVALID",
       },
       {
@@ -2456,7 +2596,7 @@ if (authoritativeOnly) {
 
   const pairs = [];
   for (let index = 0; index < workload.length; index += 1) {
-    const pair = await runAuthoritativePair(pool, workload[index], preflight[index], index, {
+    const pair = await runAuthoritativePair(pool, workload[index], nativeBaseline[index], index, {
       artifactRun: authoritativeRun,
     });
     appendPairCompleteOperation(authoritativeRun, pair, workload[index], true);
@@ -2474,7 +2614,7 @@ if (authoritativeOnly) {
           canary: 0,
           pool,
           workload,
-          preflight,
+          nativeBaseline,
           pairs,
           fivePairGate: gateForFivePairs(pairs.slice(0, 5)),
           accounting: authoritativeAccounting(pairs),
@@ -2508,7 +2648,7 @@ if (authoritativeOnly) {
             canary: 0,
             pool,
             workload,
-            preflight,
+            nativeBaseline,
             pairs,
             fivePairGate,
             accounting: authoritativeAccounting(pairs),
@@ -2581,7 +2721,7 @@ if (authoritativeOnly) {
           expected: expectedJson ?? expectedFields ?? expected ?? null,
         })
       ),
-      preflight,
+      nativeBaseline,
       pairs,
       fivePairGate,
       accounting,

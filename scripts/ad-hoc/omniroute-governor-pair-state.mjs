@@ -247,7 +247,12 @@ function outcome({
   };
 }
 
-export function evaluatePairState({ native = null, governor = null, preflight = null } = {}) {
+export function evaluatePairState({
+  native = null,
+  governor = null,
+  baseline = null,
+  preflight = null,
+} = {}) {
   if (!native?.request) {
     return outcome({
       state: PAIR_STATES.NATIVE_ARM_MISSING,
@@ -283,9 +288,36 @@ export function evaluatePairState({ native = null, governor = null, preflight = 
     });
   }
 
-  const nativeTarget = native.nativeFinalTarget || native.executedTarget || null;
-  const preflightTarget = preflight?.nativeFinalTarget || preflight?.nativeFirstTarget || null;
-  if (preflightTarget && nativeTarget && preflightTarget !== nativeTarget) {
+  const nativeFirstActualTarget =
+    native.nativeFirstActualTarget || native.nativeFirstTarget || native.executedTarget || null;
+  const nativeFinalTarget = native.nativeFinalActualTarget || native.nativeFinalTarget || null;
+  const baselineTarget = baseline?.nativeBaselineTarget || null;
+  const legacyPreflightTarget =
+    preflight?.nativeFinalTarget || preflight?.nativeFirstTarget || null;
+  if (baselineTarget && !nativeFirstActualTarget) {
+    return outcome({
+      state: PAIR_STATES.TARGET_MISMATCH,
+      failureClass: "TARGET_MISMATCH",
+      failureReason: "NATIVE_BASELINE_FIRST_ACTUAL_UNPROVEN",
+      stopBenchmark: true,
+      planState: planState.state,
+    });
+  }
+  if (baselineTarget && nativeFirstActualTarget && baselineTarget !== nativeFirstActualTarget) {
+    return outcome({
+      state: PAIR_STATES.TARGET_MISMATCH,
+      failureClass: "TARGET_MISMATCH",
+      failureReason: "NATIVE_BASELINE_DRIFT",
+      stopBenchmark: true,
+      planState: planState.state,
+    });
+  }
+  if (
+    !baselineTarget &&
+    legacyPreflightTarget &&
+    nativeFinalTarget &&
+    legacyPreflightTarget !== nativeFinalTarget
+  ) {
     return outcome({
       state: PAIR_STATES.TARGET_MISMATCH,
       failureClass: "TARGET_MISMATCH",

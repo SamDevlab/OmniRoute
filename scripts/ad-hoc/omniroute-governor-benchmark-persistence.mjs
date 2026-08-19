@@ -19,6 +19,8 @@ export const BENCHMARK_ARTIFACT_SCHEMA_VERSION = 1;
 export const RUN_ARTIFACT_SCHEMA_VERSION = 1;
 export const MAX_PERSISTED_OUTPUT_BYTES = 4_096;
 export const OPERATION_TYPES = Object.freeze([
+  "native_baseline_resolution",
+  // Retained only so the offline summarizer can read historical contaminated runs.
   "native_preflight",
   "native_arm",
   "governor_plan",
@@ -568,6 +570,9 @@ export function summarizeBenchmarkRun(runDirectoryOrId, { statusOverride } = {})
   governor.executable = governorPlans.filter((operation) => operation.executable === true).length;
   const planningValues = finiteValues(governorPlans, "planningMs");
   const planningShares = finiteValues(governorArms, "planningShare");
+  const baselineResolutionCount = operations.filter(
+    (operation) => operation.operationType === "native_baseline_resolution"
+  ).length;
   const preflightCount = operations.filter(
     (operation) => operation.operationType === "native_preflight"
   ).length;
@@ -587,6 +592,9 @@ export function summarizeBenchmarkRun(runDirectoryOrId, { statusOverride } = {})
     pairs: pairsCompleted,
     pairsAttempted: manifest.requestedPairs,
     pairsStarted: pairIds.size,
+    nativeBaselineResolutions: baselineResolutionCount,
+    nativeBaselineProviderModelRequests: 0,
+    governorProviderModelPreflightRequests: 0,
     nativePreflightRequests: preflightCount,
     nativeRequests: nativeArms.length,
     governorPlanningOperations: governorPlans.length,
