@@ -151,14 +151,15 @@ metadata-only.
 
 ## CI
 
-Quality Gates: previously pass/skipped according to PR checks; re-observe after push.
+The crash-safe commit was pushed to PR #12. In the first post-push check
+observation, Change Classification, DAST smoke, Semgrep, and Fast Production
+Build were pending; Merge integrity was skipped.
 
 Semgrep: previously pass.
 
 DAST and Fast Production Build: pending in the last observed PR check set.
 
-The new commit must be pushed to PR #12 and its checks re-observed. No
-benchmark is permitted while relevant required checks are not green.
+No benchmark is permitted while relevant required checks are not green.
 
 ## Production Code Changes
 
