@@ -21,6 +21,7 @@ import {
   evaluateQuality,
   flushSseText,
   isStreamComplete,
+  normalizeText,
 } from "./omniroute-shadow-benchmark-core.mjs";
 
 const BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://127.0.0.1:20128";
@@ -37,6 +38,7 @@ const directOnly = process.argv.includes("--direct-only");
 const replayOnly = process.argv.includes("--replay-only");
 const e2eReplayOnly = process.argv.includes("--e2e-replay");
 const calibrationRecoveryOnly = process.argv.includes("--calibration-recovery");
+const authoritativeOnly = process.argv.includes("--authoritative-e2e");
 const requestedPairs = Number(
   process.argv.find((arg) => arg.startsWith("--pairs="))?.split("=")[1] || 10
 );
@@ -129,8 +131,207 @@ const CALIBRATION_CASES = [
   { caseId: "code-reasoning", label: "ARITHMETIC" },
 ];
 
+/** Frozen before Pair 1 of the authoritative benchmark. */
+export const AUTHORITATIVE_WORKLOAD = Object.freeze([
+  {
+    id: "authoritative-exact-text",
+    category: "EXACT_TEXT",
+    prompt: "Reply with exactly AUTHORITATIVE-EXACT-OK and nothing else.",
+    expected: "AUTHORITATIVE-EXACT-OK",
+    validator: "exact",
+  },
+  {
+    id: "authoritative-structured-json",
+    category: "STRUCTURED_JSON",
+    prompt: 'Return only this JSON object: {"status":"ok","value":17}',
+    expectedJson: { status: "ok", value: 17 },
+    validator: "json",
+  },
+  {
+    id: "authoritative-arithmetic",
+    category: "ARITHMETIC",
+    prompt: "Calculate 7 multiplied by 6. Reply with the single number 42 and nothing else.",
+    expected: "42",
+    validator: "arithmetic",
+  },
+  {
+    id: "authoritative-extraction",
+    category: "EXTRACTION",
+    prompt:
+      'Extract ticket and priority from this record. Return JSON only: {"ticket":"T-2048","priority":"high"}. Record: owner=omniroute; ticket=T-2048; priority=high',
+    expectedFields: { ticket: "T-2048", priority: "high" },
+    validator: "extraction",
+  },
+  {
+    id: "authoritative-classification",
+    category: "CLASSIFICATION",
+    prompt: "Classify the word 'oak' as plant or animal. Reply with exactly plant.",
+    expected: "plant",
+    allowedValues: ["plant", "animal"],
+    validator: "classification",
+  },
+  {
+    id: "authoritative-portuguese-structured",
+    category: "PORTUGUESE_STRUCTURED",
+    prompt: 'Responda somente com este JSON: {"status":"ok","idioma":"pt","valor":17}',
+    expectedFields: { status: "ok", idioma: "pt", valor: 17 },
+    validator: "portuguese_structured",
+  },
+  {
+    id: "authoritative-english-structured",
+    category: "ENGLISH_STRUCTURED",
+    prompt: 'Return only this JSON object: {"status":"ok","language":"en","value":17}',
+    expectedFields: { status: "ok", language: "en", value: 17 },
+    validator: "english_structured",
+  },
+  {
+    id: "authoritative-transformation",
+    category: "TRANSFORMATION",
+    prompt:
+      "Transform the comma-separated tokens alpha,beta,gamma to uppercase hyphen-separated form. Reply exactly ALPHA-BETA-GAMMA.",
+    expected: "ALPHA-BETA-GAMMA",
+    validator: "transformation",
+  },
+  {
+    id: "authoritative-short-reasoning",
+    category: "SHORT_REASONING",
+    prompt: "A box has 4 rows of 6 items. Reply with exactly 24 and nothing else.",
+    expected: "24",
+    validator: "short_reasoning",
+  },
+  {
+    id: "authoritative-simple-code",
+    category: "SIMPLE_CODE",
+    prompt:
+      "Return exactly this JavaScript function and nothing else: function add(a, b) { return a + b; }",
+    expected: "function add(a, b) { return a + b; }",
+    validator: "simple_code",
+    localCheck: { operation: "add", inputs: [2, 3], result: 5 },
+  },
+]);
+
 function finite(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, stableJson(value[key])])
+    );
+  }
+  return value;
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(stableJson(left)) === JSON.stringify(stableJson(right));
+}
+
+function captureQualityOutput(content) {
+  const output = typeof content === "string" ? content : "";
+  return {
+    actualOutput: output.slice(0, MAX_OUTPUT_CAPTURE),
+    outputLength: output.length,
+    outputTruncated: output.length > MAX_OUTPUT_CAPTURE,
+  };
+}
+
+function qualityResult(input, content, pass, reason, expected = input?.expected ?? null) {
+  return {
+    pass,
+    judged: true,
+    validator: input?.validator || input?.quality || "exact",
+    expected,
+    reason: pass ? null : reason,
+    ...captureQualityOutput(content),
+  };
+}
+
+function evaluateHarnessQuality(input, content) {
+  if (
+    !input?.validator ||
+    (!input.validator.includes("structured") && input.validator !== "extraction")
+  ) {
+    return evaluateQuality(input, content, { outputCaptureLimit: MAX_OUTPUT_CAPTURE });
+  }
+
+  const actual = normalizeText(content);
+  if (!actual) return qualityResult(input, content, false, "empty_reconstructed_content");
+
+  let parsed;
+  try {
+    parsed = JSON.parse(actual);
+  } catch {
+    return qualityResult(input, content, false, "invalid_json", input.expectedFields);
+  }
+
+  const expected = input.expectedFields;
+  const pass = Object.entries(expected || {}).every(([key, value]) =>
+    sameJson(parsed?.[key], value)
+  );
+  return qualityResult(input, content, pass, "structured_field_mismatch", expected);
+}
+
+function evaluateAuthoritativeQuality(input, content) {
+  if (!input?.validator)
+    return evaluateQuality(input, content, { outputCaptureLimit: MAX_OUTPUT_CAPTURE });
+  if (input.validator.includes("structured") || input.validator === "extraction") {
+    return evaluateHarnessQuality(input, content);
+  }
+
+  const actual = normalizeText(content);
+  if (!actual) return qualityResult(input, content, false, "empty_reconstructed_content");
+  const expected = normalizeText(input.expected);
+  let pass = false;
+  let reason = "exact_value_mismatch";
+
+  switch (input.validator) {
+    case "json": {
+      try {
+        pass = sameJson(JSON.parse(actual), input.expectedJson);
+        reason = pass ? null : "json_value_mismatch";
+      } catch {
+        reason = "invalid_json";
+      }
+      return qualityResult(input, content, pass, reason, input.expectedJson);
+    }
+    case "arithmetic":
+    case "short_reasoning":
+      pass = Number(actual) === Number(expected);
+      reason = pass ? null : "numeric_value_mismatch";
+      break;
+    case "classification":
+      pass = input.allowedValues.includes(actual) && actual === expected;
+      reason = pass ? null : "closed_set_value_mismatch";
+      break;
+    case "simple_code": {
+      const localCheck = input.localCheck;
+      const localCheckPass =
+        localCheck?.operation === "add" &&
+        Array.isArray(localCheck.inputs) &&
+        localCheck.inputs.length === 2 &&
+        localCheck.inputs[0] + localCheck.inputs[1] === localCheck.result;
+      pass =
+        actual === expected &&
+        /^function add\(a, b\) \{ return a \+ b; \}$/.test(actual) &&
+        localCheckPass;
+      reason = pass
+        ? null
+        : actual === expected
+          ? "local_code_check_failed"
+          : "exact_value_mismatch";
+      break;
+    }
+    case "exact":
+    case "transformation":
+    default:
+      pass = actual === expected;
+      break;
+  }
+  return qualityResult(input, content, pass, reason, input.expected);
 }
 
 function header(response, name) {
@@ -264,9 +465,7 @@ async function readStreamingBody(response, input, started) {
     state.connectionClosedAt = performance.now();
     reader.releaseLock();
   }
-  state.quality = evaluateQuality(input, state.content, {
-    outputCaptureLimit: MAX_OUTPUT_CAPTURE,
-  });
+  state.quality = evaluateAuthoritativeQuality(input, state.content);
   state.qualityPass = state.quality.pass === true;
   state.completionMs = Math.round(state.connectionClosedAt - started);
   state.firstByteMs = state.firstByteAt ? Math.round(state.firstByteAt - started) : null;
@@ -301,7 +500,7 @@ export async function request(model, input, armLabel) {
     const stream = await readStreamingBody(response, input, started);
     const responseCorrelationId = header(response, "x-correlation-id");
     const streamCompleted = isStreamComplete(response.status, stream);
-    const quality = stream.quality || evaluateQuality(input, stream.content);
+    const quality = stream.quality || evaluateAuthoritativeQuality(input, stream.content);
     const callLogIdentity = await readCallLogIdentity([
       requestCorrelationId,
       responseCorrelationId,
@@ -363,7 +562,7 @@ export async function request(model, input, armLabel) {
       actualOutput: "",
       outputLength: 0,
       outputTruncated: false,
-      qualityValidator: input.quality || "exact",
+      qualityValidator: input.validator || input.quality || "exact",
       qualityReason: "transport_error",
       qualityPass: false,
       failureClass:
@@ -501,6 +700,32 @@ async function buildPool() {
   const byProvider = {};
   for (const target of targets)
     byProvider[target.provider] = (byProvider[target.provider] || 0) + 1;
+  const breakers = Object.fromEntries(
+    Object.keys(byProvider).map((provider) => [provider, getCircuitBreaker(provider).getStatus()])
+  );
+  const cooldowns = connections
+    .filter((connection) => {
+      const rateLimitedUntil = connection.rateLimitedUntil
+        ? new Date(connection.rateLimitedUntil).getTime()
+        : 0;
+      return Number.isFinite(rateLimitedUntil) && rateLimitedUntil > Date.now();
+    })
+    .map((connection) => ({
+      provider: connection.provider,
+      connectionId: connection.id,
+      rateLimitedUntil: connection.rateLimitedUntil,
+    }));
+  const lockouts = candidates
+    .filter(
+      (candidate) =>
+        candidate.connectionId &&
+        getModelLockoutInfo(candidate.provider, candidate.connectionId, candidate.model)
+    )
+    .map((candidate) => ({
+      provider: candidate.provider,
+      model: candidate.model,
+      connectionId: candidate.connectionId,
+    }));
   return {
     virtualCombo,
     targets,
@@ -509,6 +734,10 @@ async function buildPool() {
     metadata,
     connectionState,
     byProvider,
+    snapshotAt: new Date().toISOString(),
+    breakers,
+    cooldowns,
+    lockouts,
     raw: targets.length,
     active: targets.length,
     eligible: candidates.filter((candidate) => candidate.quotaCutoffBlocked !== true).length,
@@ -819,12 +1048,13 @@ async function runGovernorE2E(pool, input, nativeKey) {
     max_tokens: MAX_TOKENS,
   };
   const planningStarted = performance.now();
+  const planningCorrelationId = `e2e-governor-${input.id}-${randomUUID()}`;
   const runtime = await applyGovernorToAutoComboOrder({
     body,
     promptText: input.prompt,
     estimatedInputTokens: estimateFinalInputTokens(body),
     taskType: "default",
-    correlationId: `e2e-governor-${input.id}-${randomUUID()}`,
+    correlationId: planningCorrelationId,
     nativeSelectedTarget: nativeTargetResolved,
     orderedTargets: pool.targets,
     routableCandidates: pool.candidates,
@@ -838,6 +1068,7 @@ async function runGovernorE2E(pool, input, nativeKey) {
       valid: false,
       reason: "governor_plan_not_executable",
       planningMs,
+      planningCorrelationId,
       e2eCompletionMs: Math.round(performance.now() - started),
       plan,
     };
@@ -855,6 +1086,7 @@ async function runGovernorE2E(pool, input, nativeKey) {
       reason: "governor_target_stale",
       failureClass: "STALE_PLAN",
       planningMs,
+      planningCorrelationId,
       e2eCompletionMs: Math.round(performance.now() - started),
       plan,
       plannedTarget,
@@ -863,11 +1095,25 @@ async function runGovernorE2E(pool, input, nativeKey) {
   }
   const direct = await request(modelForTarget(pool, provider, model), input, "governor-e2e-direct");
   const executedTarget = direct.executedTarget;
-  const targetIdentity = executedTarget
-    ? executedTarget === key
-      ? "PASS"
-      : "MISMATCH"
-    : "UNKNOWN";
+  const targetMatch = executedTarget ? (executedTarget === key ? "PASS" : "MISMATCH") : "UNKNOWN";
+  const plannedConnectionId = plannedTarget?.connectionId || null;
+  const allowedConnectionIds = plannedTarget?.allowedConnectionIds || [];
+  const connectionIdentity =
+    plannedConnectionId && plannedConnectionId !== "noauth"
+      ? direct.executedConnectionId === plannedConnectionId
+        ? "PASS"
+        : "MISMATCH"
+      : direct.executedConnectionId && allowedConnectionIds.includes(direct.executedConnectionId)
+        ? "PASS"
+        : plannedConnectionId === "noauth" && direct.executedConnectionId === "noauth"
+          ? "PASS"
+          : "NOT_AVAILABLE";
+  const targetIdentity =
+    targetMatch === "MISMATCH" || connectionIdentity === "MISMATCH"
+      ? "MISMATCH"
+      : targetMatch === "UNKNOWN"
+        ? "UNKNOWN"
+        : "PASS";
   const identityFailureClass =
     targetIdentity === "MISMATCH"
       ? "TARGET_MISMATCH"
@@ -879,6 +1125,7 @@ async function runGovernorE2E(pool, input, nativeKey) {
     valid: direct.status === 200 && direct.streamCompleted && identityFailureClass === null,
     failureClass: identityFailureClass || direct.failureClass,
     planningMs,
+    planningCorrelationId,
     e2eCompletionMs: Math.round(performance.now() - started),
     plan,
     plannedTarget,
@@ -886,6 +1133,8 @@ async function runGovernorE2E(pool, input, nativeKey) {
     plannedConnectionId: plannedTarget?.connectionId || null,
     executedConnectionId: direct.executedConnectionId,
     targetIdentity,
+    targetMatch,
+    connectionIdentity,
     revalidation,
     direct,
     selectedTarget: key,
@@ -906,6 +1155,8 @@ async function runNativeE2E(input) {
           )
         : null;
   const executedTarget = requestResult.executedTarget;
+  const nativeFinalTarget = executedTarget || observedTarget;
+  const nativeFirstTarget = requestResult.fallbackAttempts === 0 ? observedTarget : null;
   const targetIdentity =
     observedTarget && executedTarget
       ? observedTarget === executedTarget
@@ -927,6 +1178,8 @@ async function runNativeE2E(input) {
     request: requestResult,
     plan,
     selectedTarget: observedTarget,
+    nativeFirstTarget,
+    nativeFinalTarget,
     executedTarget,
     executedConnectionId: requestResult.executedConnectionId,
     targetIdentity,
@@ -1041,6 +1294,10 @@ function compactRequest(request) {
     completionMs: request.completionMs,
     streamEventCount: request.streamEventCount,
     responseModel: request.responseModel,
+    requestCorrelationId: request.requestCorrelationId,
+    responseCorrelationId: request.responseCorrelationId,
+    correlationId: request.correlationId,
+    requestId: request.requestId,
     executedTarget: request.executedTarget,
     executedConnectionId: request.executedConnectionId,
   };
@@ -1059,6 +1316,8 @@ function compactE2E(pairs) {
         valid: pair.native.valid,
         failureClass: pair.native.failureClass || null,
         selectedTarget: pair.native.selectedTarget,
+        nativeFirstTarget: pair.native.nativeFirstTarget || null,
+        nativeFinalTarget: pair.native.nativeFinalTarget || null,
         executedTarget: pair.native.executedTarget || null,
         executedConnectionId: pair.native.executedConnectionId || null,
         targetIdentity: pair.native.targetIdentity || null,
@@ -1074,13 +1333,392 @@ function compactE2E(pairs) {
         plannedConnectionId: pair.governor.plannedConnectionId || null,
         executedConnectionId: pair.governor.executedConnectionId || null,
         targetIdentity: pair.governor.targetIdentity || null,
+        targetMatch: pair.governor.targetMatch || null,
+        connectionIdentity: pair.governor.connectionIdentity || null,
         planningMs: pair.governor.planningMs,
+        planningCorrelationId: pair.governor.planningCorrelationId || null,
         e2eCompletionMs: pair.governor.e2eCompletionMs,
         revalidation: pair.governor.revalidation || null,
         direct: compactRequest(pair.governor.direct),
       },
     };
   });
+}
+
+async function runAuthoritativeNativePreflight(input) {
+  const requestResult = await request("auto/chat", input, "authoritative-target-preflight");
+  const plan = await readGovernorPlan(requestResult.correlationId);
+  const observedTarget =
+    plan?.actualProvider && plan?.actualModel
+      ? normalizeTarget(plan.actualProvider, plan.actualModel)
+      : requestResult.responseModel
+        ? normalizeTarget(
+            parseModel(requestResult.responseModel).provider || "unknown",
+            parseModel(requestResult.responseModel).model || requestResult.responseModel
+          )
+        : null;
+  const finalTarget = requestResult.executedTarget || observedTarget;
+  const firstTarget = requestResult.fallbackAttempts === 0 ? observedTarget : null;
+  const targetIdentity =
+    observedTarget && requestResult.executedTarget
+      ? observedTarget === requestResult.executedTarget
+        ? "PASS"
+        : "MISMATCH"
+      : "UNKNOWN";
+  return {
+    caseId: input.id,
+    nativeFirstTarget: firstTarget,
+    nativeFinalTarget: finalTarget,
+    observedTarget,
+    targetIdentity,
+    valid: requestResult.status === 200 && requestResult.streamCompleted && Boolean(finalTarget),
+    failureClass:
+      targetIdentity === "MISMATCH"
+        ? "TARGET_MISMATCH"
+        : targetIdentity === "UNKNOWN"
+          ? "HARNESS_FAILURE"
+          : requestResult.failureClass,
+    request: requestResult,
+    plan,
+  };
+}
+
+function pairLatencyWinner(native, governor) {
+  if (
+    native.qualityPass !== true ||
+    governor.qualityPass !== true ||
+    native.status !== 200 ||
+    governor.status !== 200 ||
+    native.streamCompleted !== true ||
+    governor.streamCompleted !== true
+  ) {
+    return "tie";
+  }
+  const nativeE2E = native.e2eCompletionMs;
+  const governorE2E = governor.e2eCompletionMs;
+  if (!Number.isFinite(nativeE2E) || !Number.isFinite(governorE2E)) return "tie";
+  if (nativeE2E >= governorE2E * 1.15) return "governor";
+  if (governorE2E >= nativeE2E * 1.15) return "native";
+  return "tie";
+}
+
+function buildAuthoritativePair(pairId, input, order, preflight, native, governor) {
+  const nativeSuccess = native.request?.status === 200 && native.request?.streamCompleted === true;
+  const governorSuccess =
+    governor.direct?.status === 200 && governor.direct?.streamCompleted === true;
+  const nativeQuality = native.request?.qualityPass === true;
+  const governorQuality = governor.direct?.qualityPass === true;
+  const qualityWinner =
+    nativeQuality === governorQuality ? "tie" : nativeQuality ? "native" : "governor";
+  const reliabilityWinner =
+    native.request?.streamCompleted === governor.direct?.streamCompleted
+      ? "tie"
+      : native.request?.streamCompleted
+        ? "native"
+        : "governor";
+  const latencyWinner = pairLatencyWinner(native.request, governor.direct);
+  const winner =
+    qualityWinner !== "tie"
+      ? qualityWinner
+      : nativeSuccess !== governorSuccess
+        ? nativeSuccess
+          ? "native"
+          : "governor"
+        : latencyWinner;
+  const winnerReason =
+    qualityWinner !== "tie"
+      ? "quality"
+      : nativeSuccess !== governorSuccess
+        ? "success_or_complete_stream"
+        : latencyWinner !== "tie"
+          ? "total_e2e_latency_15_percent_threshold"
+          : "tie";
+  const nativeFirstTarget = native.nativeFirstTarget || preflight.nativeFirstTarget || null;
+  const nativeFinalTarget =
+    native.nativeFinalTarget || native.selectedTarget || preflight.nativeFinalTarget;
+  const governorTarget = governor.selectedTarget || null;
+  const agreement =
+    nativeFirstTarget && governorTarget ? nativeFirstTarget === governorTarget : null;
+  return {
+    pairId,
+    caseId: input.id,
+    category: input.category,
+    prompt: input.prompt,
+    expected: input.expectedJson ?? input.expectedFields ?? input.expected ?? null,
+    validator: input.validator || input.quality || "exact",
+    order,
+    authoritative: true,
+    native,
+    governor,
+    nativeFirstTarget,
+    nativeFinalTarget,
+    governorSelectedTarget: governorTarget,
+    agreement,
+    preflightTarget: preflight.nativeFinalTarget,
+    preflightTargetMatch: preflight.nativeFinalTarget === nativeFinalTarget ? "PASS" : "MISMATCH",
+    pairwise: {
+      qualityWinner,
+      reliabilityWinner,
+      latencyWinner,
+      winner,
+      winnerReason,
+      completionDeltaMs:
+        (governor.e2eCompletionMs ?? governor.direct?.latencyMs ?? null) -
+        (native.e2eCompletionMs ?? native.request?.latencyMs ?? null),
+    },
+    invalid:
+      native.valid !== true ||
+      governor.valid !== true ||
+      governor.targetIdentity !== "PASS" ||
+      governor.failureClass === "TARGET_MISMATCH" ||
+      governor.failureClass === "STALE_PLAN",
+  };
+}
+
+async function runAuthoritativePair(pool, input, preflight, pairIndex) {
+  const nativeKey = preflight.nativeFinalTarget || preflight.nativeFirstTarget;
+  if (!nativeKey) {
+    return {
+      pairId: `pair-${String(pairIndex + 1).padStart(2, "0")}`,
+      caseId: input.id,
+      category: input.category,
+      order: pairIndex % 2 === 1 ? "governor_then_native" : "native_then_governor",
+      authoritative: true,
+      invalid: true,
+      preflightTarget: null,
+      native: { valid: false, failureClass: "HARNESS_FAILURE" },
+      governor: { valid: false, failureClass: "HARNESS_FAILURE" },
+    };
+  }
+  const governorFirst = pairIndex % 2 === 1;
+  const order = governorFirst ? "governor_then_native" : "native_then_governor";
+  const governorPromise = () => runGovernorE2E(pool, input, nativeKey);
+  const nativePromise = () => runNativeE2E(input);
+  const first = governorFirst ? await governorPromise() : await nativePromise();
+  const second = governorFirst ? await nativePromise() : await governorPromise();
+  const native = governorFirst ? second : first;
+  const governor = governorFirst ? first : second;
+  return buildAuthoritativePair(
+    `pair-${String(pairIndex + 1).padStart(2, "0")}`,
+    input,
+    order,
+    preflight,
+    native,
+    governor
+  );
+}
+
+function percentile(values, fraction) {
+  const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+  return sorted.length
+    ? sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * fraction))]
+    : null;
+}
+
+function mean(values) {
+  const finiteValues = values.filter(Number.isFinite);
+  return finiteValues.length
+    ? Math.round(
+        (finiteValues.reduce((sum, value) => sum + value, 0) / finiteValues.length) * 100
+      ) / 100
+    : null;
+}
+
+function timingAggregate(values) {
+  return {
+    mean: mean(values),
+    p50: percentile(values, 0.5),
+    p95: percentile(values, 0.95),
+    max: values.filter(Number.isFinite).length ? Math.max(...values.filter(Number.isFinite)) : null,
+  };
+}
+
+function authoritativeArmAggregate(pairs, side) {
+  const results = pairs.map((pair) => pair[side]);
+  const requests = results.map((result) => (side === "native" ? result.request : result.direct));
+  const e2e = results.map((result) => result.e2eCompletionMs);
+  const headers = requests.map((request) => request?.headersAtMs);
+  const ttft = requests.map((request) => request?.firstContentMs);
+  const completion = requests.map((request) => request?.completionMs);
+  const attempts = requests.map((request) =>
+    Number.isFinite(request?.fallbackAttempts) ? request.fallbackAttempts + 1 : null
+  );
+  const fallbackCounts = requests
+    .map((request) => request?.fallbackAttempts)
+    .filter(Number.isFinite);
+  const result = {
+    pairs: pairs.length,
+    http: requests.filter((request) => request?.status === 200).length,
+    stream: requests.filter((request) => request?.streamCompleted === true).length,
+    quality: requests.filter((request) => request?.qualityPass === true).length,
+    headers: timingAggregate(headers),
+    ttft: timingAggregate(ttft),
+    completion: timingAggregate(completion),
+    e2e: timingAggregate(e2e),
+    attemptsMean: mean(attempts),
+    attemptsMax: attempts.filter(Number.isFinite).length
+      ? Math.max(...attempts.filter(Number.isFinite))
+      : null,
+    fallbackCount: fallbackCounts.reduce((sum, value) => sum + value, 0),
+  };
+  if (side === "governor") {
+    const planning = results.map((result) => result.planningMs);
+    const planningShare = results.map((result) =>
+      Number.isFinite(result.planningMs) &&
+      Number.isFinite(result.e2eCompletionMs) &&
+      result.e2eCompletionMs > 0
+        ? result.planningMs / result.e2eCompletionMs
+        : null
+    );
+    result.planning = timingAggregate(planning);
+    result.planningShare = {
+      mean: mean(planningShare),
+      p50: percentile(planningShare, 0.5),
+    };
+    result.plans = results.filter((result) => Boolean(result.plan)).length;
+    result.executable = results.filter((result) => result.plan?.executable === true).length;
+  }
+  return result;
+}
+
+function authoritativeAccounting(pairs) {
+  const rows = [];
+  for (const pair of pairs) {
+    const nativeRequest = pair.native.request;
+    const governorRequest = pair.governor.direct;
+    rows.push({
+      pairId: pair.pairId,
+      caseId: pair.caseId,
+      arm: "native",
+      order: pair.order,
+      authoritative: true,
+      requestCorrelationId: nativeRequest?.requestCorrelationId || null,
+      responseCorrelationId: nativeRequest?.responseCorrelationId || null,
+      requestId: nativeRequest?.requestId || null,
+    });
+    rows.push({
+      pairId: pair.pairId,
+      caseId: pair.caseId,
+      arm: "governor",
+      operation: "planning",
+      order: pair.order,
+      authoritative: true,
+      planningCorrelationId: pair.governor.planningCorrelationId || null,
+    });
+    rows.push({
+      pairId: pair.pairId,
+      caseId: pair.caseId,
+      arm: "governor",
+      operation: "execution",
+      order: pair.order,
+      authoritative: true,
+      requestCorrelationId: governorRequest?.requestCorrelationId || null,
+      responseCorrelationId: governorRequest?.responseCorrelationId || null,
+      requestId: governorRequest?.requestId || null,
+    });
+  }
+  return {
+    authoritativePairs: pairs.length,
+    nativeRequests: pairs.length,
+    governorPlanningOperations: pairs.length,
+    governorExecutionRequests: pairs.filter((pair) => Boolean(pair.governor.direct)).length,
+    physicalRequests: pairs.length + pairs.filter((pair) => Boolean(pair.governor.direct)).length,
+    rows,
+  };
+}
+
+function gateForFivePairs(pairs) {
+  const native = authoritativeArmAggregate(pairs, "native");
+  const governor = authoritativeArmAggregate(pairs, "governor");
+  const accounting = authoritativeAccounting(pairs);
+  const failureClasses = [
+    ...pairs.flatMap((pair) => [pair.native.failureClass, pair.governor.failureClass]),
+  ].filter(Boolean);
+  const invalid = pairs.filter((pair) => pair.invalid === true).length;
+  const correlationPass = pairs.every(
+    (pair) =>
+      Boolean(pair.native.request?.correlationId) && Boolean(pair.governor.direct?.correlationId)
+  );
+  const identityPass = pairs.every((pair) => pair.governor.targetIdentity === "PASS");
+  const forbiddenFailures = failureClasses.filter((failureClass) =>
+    [
+      "HARNESS_FAILURE",
+      "VALIDATOR_FAILURE",
+      "TARGET_MISMATCH",
+      "STALE_PLAN",
+      "SYSTEMIC_RUNTIME_FAILURE",
+    ].includes(failureClass)
+  );
+  const pass =
+    pairs.length === 5 &&
+    native.http === 5 &&
+    native.stream === 5 &&
+    governor.plans === 5 &&
+    governor.executable === 5 &&
+    governor.http === 5 &&
+    governor.stream === 5 &&
+    accounting.nativeRequests === 5 &&
+    accounting.governorPlanningOperations === 5 &&
+    accounting.governorExecutionRequests === 5 &&
+    accounting.physicalRequests === 10 &&
+    correlationPass &&
+    identityPass &&
+    invalid === 0 &&
+    forbiddenFailures.length === 0;
+  return {
+    pass,
+    pairs: pairs.length,
+    nativeHttp: native.http,
+    nativeStreams: native.stream,
+    governorPlans: governor.plans,
+    governorExecutable: governor.executable,
+    governorHttp: governor.http,
+    governorStreams: governor.stream,
+    accounting: pass ? "PASS" : "FAIL",
+    identity: identityPass ? "PASS" : "FAIL",
+    correlation: correlationPass ? "PASS" : "FAIL",
+    invalid,
+    failureClasses,
+    forbiddenFailures,
+  };
+}
+
+function authoritativePairwise(pairs) {
+  const count = (selector, value) => pairs.filter((pair) => selector(pair) === value).length;
+  return {
+    governorWins: count((pair) => pair.pairwise.winner, "governor"),
+    nativeWins: count((pair) => pair.pairwise.winner, "native"),
+    ties: count((pair) => pair.pairwise.winner, "tie"),
+    invalid: pairs.filter((pair) => pair.invalid).length,
+    governorQualityWins: count((pair) => pair.pairwise.qualityWinner, "governor"),
+    nativeQualityWins: count((pair) => pair.pairwise.qualityWinner, "native"),
+    governorLatencyWins: count((pair) => pair.pairwise.latencyWinner, "governor"),
+    nativeLatencyWins: count((pair) => pair.pairwise.latencyWinner, "native"),
+  };
+}
+
+function targetDistribution(pairs, side) {
+  const values = pairs
+    .map((pair) => (side === "native" ? pair.nativeFinalTarget : pair.governorSelectedTarget))
+    .filter(Boolean);
+  return Object.fromEntries(
+    Object.entries(Object.groupBy(values, (value) => value)).map(([key, group]) => [
+      key,
+      group.length,
+    ])
+  );
+}
+
+function authoritativeConclusion(pairs, aggregates, pairwise) {
+  const validPairs = pairs.filter((pair) => !pair.invalid);
+  if (validPairs.length === 0) return "E2E_INCONCLUSIVE";
+  const nativeQuality = aggregates.native.quality;
+  const governorQuality = aggregates.governor.quality;
+  if (governorQuality < nativeQuality) return "NATIVE_E2E_BETTER";
+  if (nativeQuality < governorQuality) return "GOVERNOR_E2E_BETTER";
+  if (pairwise.nativeWins > pairwise.governorWins) return "NATIVE_E2E_BETTER";
+  if (pairwise.governorWins > pairwise.nativeWins) return "GOVERNOR_E2E_BETTER";
+  return "E2E_ROUGHLY_EQUIVALENT";
 }
 
 function calibrationRecoverySummary(pairs) {
@@ -1213,6 +1851,173 @@ if (calibrationRecoveryOnly) {
     summary,
   });
   process.exit(summary.calibrationPassed ? 0 : 2);
+}
+if (authoritativeOnly) {
+  const pairLimit = Math.min(
+    10,
+    Math.max(5, Number.isInteger(requestedPairs) ? requestedPairs : 10)
+  );
+  const workload = AUTHORITATIVE_WORKLOAD.slice(0, pairLimit);
+  const preflight = [];
+  for (const input of workload) {
+    preflight.push(await runAuthoritativeNativePreflight(input));
+  }
+  const missingPreflight = preflight.filter((item) => !item.nativeFinalTarget || !item.valid);
+  if (missingPreflight.length > 0) {
+    outputDocument({
+      governor: "simulate / false / 0",
+      canary: 0,
+      pool: {
+        raw: pool.raw,
+        active: pool.active,
+        eligible: pool.eligible,
+        healthy: pool.healthy,
+        executable: "per-request plan; not a pool scalar",
+        byProvider: pool.byProvider,
+        snapshotAt: pool.snapshotAt,
+        breakers: pool.breakers,
+        cooldowns: pool.cooldowns,
+        lockouts: pool.lockouts,
+      },
+      workload: workload.map(
+        ({ id, category, prompt, validator, expected, expectedJson, expectedFields }) => ({
+          id,
+          category,
+          prompt,
+          validator,
+          expected: expectedJson ?? expectedFields ?? expected ?? null,
+        })
+      ),
+      preflight: preflight.map((item) => ({
+        caseId: item.caseId,
+        nativeFirstTarget: item.nativeFirstTarget,
+        nativeFinalTarget: item.nativeFinalTarget,
+        targetIdentity: item.targetIdentity,
+        valid: item.valid,
+        failureClass: item.failureClass || null,
+      })),
+      pairs: [],
+      fivePairGate: { pass: false, reason: "authoritative_native_target_preflight_failed" },
+      stopReason: "BENCHMARK_INVALID",
+    });
+    process.exit(2);
+  }
+
+  const pairs = [];
+  for (let index = 0; index < workload.length; index += 1) {
+    const pair = await runAuthoritativePair(pool, workload[index], preflight[index], index);
+    pairs.push(pair);
+    if (index === 4 && pairLimit > 5) {
+      const fivePairGate = gateForFivePairs(pairs.slice(0, 5));
+      console.error(`[AUTHORITATIVE] five-pair gate=${fivePairGate.pass ? "PASS" : "FAIL"}`);
+      if (!fivePairGate.pass) {
+        const aggregates = {
+          native: authoritativeArmAggregate(pairs, "native"),
+          governor: authoritativeArmAggregate(pairs, "governor"),
+        };
+        outputDocument({
+          governor: "simulate / false / 0",
+          canary: 0,
+          pool,
+          workload,
+          preflight,
+          pairs,
+          fivePairGate,
+          accounting: authoritativeAccounting(pairs),
+          aggregates,
+          pairwise: authoritativePairwise(pairs),
+          stopReason: "FIVE_PAIR_GATE_FAILED",
+        });
+        process.exit(2);
+      }
+    }
+  }
+
+  const fivePairGate = gateForFivePairs(pairs.slice(0, 5));
+  const accounting = authoritativeAccounting(pairs);
+  const aggregates = {
+    native: authoritativeArmAggregate(pairs, "native"),
+    governor: authoritativeArmAggregate(pairs, "governor"),
+  };
+  const pairwise = authoritativePairwise(pairs);
+  const nativeE2EP50 = aggregates.native.e2e.p50;
+  const governorE2EP50 = aggregates.governor.e2e.p50;
+  const nativeE2EMean = aggregates.native.e2e.mean;
+  const governorE2EMean = aggregates.governor.e2e.mean;
+  const speed = {
+    p50RatioNativeGovernor:
+      Number.isFinite(nativeE2EP50) && Number.isFinite(governorE2EP50) && governorE2EP50 > 0
+        ? nativeE2EP50 / governorE2EP50
+        : null,
+    meanRatioNativeGovernor:
+      Number.isFinite(nativeE2EMean) && Number.isFinite(governorE2EMean) && governorE2EMean > 0
+        ? nativeE2EMean / governorE2EMean
+        : null,
+  };
+  const nativeChoices = targetDistribution(pairs, "native");
+  const governorChoices = targetDistribution(pairs, "governor");
+  const knownAgreements = pairs.filter((pair) => pair.agreement !== null);
+  const outlier = (side, direction) => {
+    const candidates = pairs
+      .map((pair) => ({ pair, value: pair[side].e2eCompletionMs }))
+      .filter((item) => Number.isFinite(item.value));
+    if (!candidates.length) return null;
+    return candidates.reduce((best, item) =>
+      direction === "slowest"
+        ? item.value > best.value
+          ? item
+          : best
+        : item.value < best.value
+          ? item
+          : best
+    );
+  };
+  outputDocument({
+    governor: "simulate / false / 0",
+    canary: 0,
+    pool,
+    workload: workload.map(
+      ({ id, category, prompt, validator, expected, expectedJson, expectedFields }) => ({
+        id,
+        category,
+        prompt,
+        validator,
+        expected: expectedJson ?? expectedFields ?? expected ?? null,
+      })
+    ),
+    preflight,
+    pairs,
+    fivePairGate,
+    accounting,
+    aggregates,
+    speed,
+    pairwise,
+    choices: {
+      agreement: knownAgreements.filter((pair) => pair.agreement === true).length,
+      disagreement: knownAgreements.filter((pair) => pair.agreement === false).length,
+      agreementRate: knownAgreements.length
+        ? knownAgreements.filter((pair) => pair.agreement === true).length / knownAgreements.length
+        : null,
+      native: nativeChoices,
+      governor: governorChoices,
+      governorConcentration: pairs.length
+        ? Math.max(...Object.values(governorChoices), 0) / pairs.length
+        : null,
+    },
+    outliers: {
+      nativeSlowest: outlier("native", "slowest"),
+      nativeFastest: outlier("native", "fastest"),
+      governorSlowest: outlier("governor", "slowest"),
+      governorFastest: outlier("governor", "fastest"),
+    },
+    conclusion: fivePairGate.pass
+      ? authoritativeConclusion(pairs, aggregates, pairwise)
+      : "E2E_INCONCLUSIVE",
+    cost: "INCOMPLETE",
+    decisionBenchmark: "INCONCLUSIVE",
+    canaryReadiness: "NOT_READY",
+  });
+  process.exit(fivePairGate.pass ? 0 : 2);
 }
 if (e2eReplayOnly) {
   const decisions = replayLatestDecisionsFromTelemetry();

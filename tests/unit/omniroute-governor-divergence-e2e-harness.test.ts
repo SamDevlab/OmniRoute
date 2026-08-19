@@ -18,7 +18,13 @@ const harnessPath = new URL(
 const harnessSource = fs.readFileSync(harnessPath, "utf8");
 
 test("divergence harness keeps a fixed 12-category workload and no adaptive case generation", () => {
-  const categories = [...harnessSource.matchAll(/category: "([A-Z_]+)"/g)].map((match) => match[1]);
+  const workloadSource = harnessSource.match(
+    /export const DIVERGENCE_WORKLOAD = \[(.*?)\n\];/s
+  )?.[1];
+  assert.ok(workloadSource);
+  const categories = [...workloadSource.matchAll(/category: "([A-Z_]+)"/g)].map(
+    (match) => match[1]
+  );
   assert.equal(categories.length, 12);
   assert.deepEqual(new Set(categories).size, 12);
   assert.deepEqual(categories, [
@@ -37,6 +43,36 @@ test("divergence harness keeps a fixed 12-category workload and no adaptive case
   ]);
   assert.match(harnessSource, /applyGovernorToAutoComboOrder/);
   assert.doesNotMatch(harnessSource, /GOVERNOR_ACTIVE_CANARY_RATE\s*=\s*1/);
+});
+
+test("authoritative harness freezes ten cases and stops expansion on a failed five-pair gate", () => {
+  const workloadSource = harnessSource.match(
+    /export const AUTHORITATIVE_WORKLOAD = Object\.freeze\(\[(.*?)\n\]\);/s
+  )?.[1];
+  assert.ok(workloadSource);
+  const categories = [...workloadSource.matchAll(/category: "([A-Z_]+)"/g)].map(
+    (match) => match[1]
+  );
+  assert.deepEqual(categories, [
+    "EXACT_TEXT",
+    "STRUCTURED_JSON",
+    "ARITHMETIC",
+    "EXTRACTION",
+    "CLASSIFICATION",
+    "PORTUGUESE_STRUCTURED",
+    "ENGLISH_STRUCTURED",
+    "TRANSFORMATION",
+    "SHORT_REASONING",
+    "SIMPLE_CODE",
+  ]);
+  assert.match(harnessSource, /--authoritative-e2e/);
+  assert.match(harnessSource, /gateForFivePairs/);
+  assert.match(harnessSource, /FIVE_PAIR_GATE_FAILED/);
+  assert.match(harnessSource, /five-pair gate=/);
+  assert.match(harnessSource, /1\.15/);
+  assert.match(harnessSource, /planningShare/);
+  assert.match(harnessSource, /authoritativeAccounting/);
+  assert.match(harnessSource, /authoritative_native_target_preflight_failed/);
 });
 
 test("E2E harness measures Governor planning before direct execution and records stale skips", () => {
@@ -64,8 +100,12 @@ test("E2E harness measures Governor planning before direct execution and records
   assert.match(harnessSource, /executedTarget/);
   assert.match(harnessSource, /calibrationRecoverySummary/);
   assert.match(harnessSource, /headersMs/);
+  assert.match(harnessSource, /headersAtMs/);
   assert.match(harnessSource, /readerCompleted/);
   assert.match(harnessSource, /streamEventCount/);
+  assert.match(harnessSource, /requestCorrelationId/);
+  assert.match(harnessSource, /responseCorrelationId/);
+  assert.match(harnessSource, /connectionIdentity/);
 });
 
 test("calibration validator passes exact output and classifies fenced code as model quality failure", () => {
