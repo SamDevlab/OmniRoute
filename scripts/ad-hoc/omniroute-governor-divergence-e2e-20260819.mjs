@@ -23,7 +23,11 @@ import {
   isStreamComplete,
   normalizeText,
 } from "./omniroute-shadow-benchmark-core.mjs";
-import { persistBenchmarkArtifact } from "./omniroute-governor-benchmark-persistence.mjs";
+import {
+  createBenchmarkRun,
+  hashJson,
+  persistBenchmarkArtifact,
+} from "./omniroute-governor-benchmark-persistence.mjs";
 
 const BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://127.0.0.1:20128";
 const REQUEST_TIMEOUT_MS = Math.max(
@@ -43,6 +47,10 @@ const authoritativeOnly = process.argv.includes("--authoritative-e2e");
 const requestedPairs = Number(
   process.argv.find((arg) => arg.startsWith("--pairs="))?.split("=")[1] || 10
 );
+
+let activeBenchmarkRun = null;
+let signalHandlersInstalled = false;
+let activeBenchmarkSignalHandler = null;
 
 /** Fixed before any request. Do not edit this list based on observed choices. */
 export const DIVERGENCE_WORKLOAD = [
@@ -464,6 +472,7 @@ async function readStreamingBody(response, input, started) {
     state.readerCompleted = true;
   } finally {
     state.connectionClosedAt = performance.now();
+    state.readerCloseMs = Math.round(state.connectionClosedAt - started);
     reader.releaseLock();
   }
   state.quality = evaluateAuthoritativeQuality(input, state.content);
@@ -477,6 +486,7 @@ async function readStreamingBody(response, input, started) {
 
 export async function request(model, input, armLabel) {
   const started = performance.now();
+  const startedAt = new Date().toISOString();
   const requestCorrelationId = `divergence-${input.id}-${armLabel}-${randomUUID()}`;
   let response = null;
   try {
@@ -507,6 +517,8 @@ export async function request(model, input, armLabel) {
       responseCorrelationId,
     ]);
     return {
+      startedAt,
+      completedAt: new Date().toISOString(),
       status: response.status,
       completionMs: stream.completionMs ?? Math.round(performance.now() - started),
       latencyMs: Math.round(performance.now() - started),
@@ -514,6 +526,7 @@ export async function request(model, input, armLabel) {
       firstByteMs: stream.firstByteMs,
       firstContentMs: stream.firstContentMs,
       doneMs: stream.doneMs,
+      readerCloseMs: stream.readerCloseMs,
       streamCompleted,
       readerCompleted: stream.readerCompleted,
       streamEventCount: stream.eventCount,
@@ -548,6 +561,8 @@ export async function request(model, input, armLabel) {
   } catch (error) {
     const name = error instanceof Error ? error.name : "TRANSPORT_ERROR";
     return {
+      startedAt,
+      completedAt: new Date().toISOString(),
       status: 0,
       completionMs: null,
       latencyMs: Math.round(performance.now() - started),
@@ -555,6 +570,7 @@ export async function request(model, input, armLabel) {
       firstByteMs: null,
       firstContentMs: null,
       doneMs: null,
+      readerCloseMs: null,
       streamCompleted: false,
       readerCompleted: false,
       streamEventCount: 0,
@@ -1034,13 +1050,39 @@ async function runDirectComparisons(pool, decisions) {
   return results;
 }
 
-async function runGovernorE2E(pool, input, nativeKey) {
+async function runGovernorE2E(
+  pool,
+  input,
+  nativeKey,
+  { artifactRun = null, pairId = null, order = null, authoritative = false } = {}
+) {
   const started = performance.now();
+  const startedAt = new Date().toISOString();
   const nativeTargetResolved = pool.targets.find(
     (target) => targetFromResolved(target).key === nativeKey
   );
   if (!nativeTargetResolved) {
-    return { caseId: input.id, valid: false, reason: "native_target_not_in_current_pool" };
+    const governorPlanOperationId = appendGovernorPlanOperation(artifactRun, {
+      pairId,
+      input,
+      order,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      planningMs: null,
+      plan: null,
+      plannedTarget: null,
+      failureClass: "HARNESS_FAILURE",
+      authoritative,
+    });
+    return {
+      caseId: input.id,
+      valid: false,
+      reason: "native_target_not_in_current_pool",
+      failureClass: "HARNESS_FAILURE",
+      governorPlanOperationId,
+      startedAt,
+      completedAt: new Date().toISOString(),
+    };
   }
   const body = {
     model: "auto/chat",
@@ -1049,7 +1091,8 @@ async function runGovernorE2E(pool, input, nativeKey) {
     max_tokens: MAX_TOKENS,
   };
   const planningStarted = performance.now();
-  const planningCorrelationId = `e2e-governor-${input.id}-${randomUUID()}`;
+  const planningStartedAt = new Date().toISOString();
+  const planningCorrelationId = "e2e-governor-" + input.id + "-" + randomUUID();
   const runtime = await applyGovernorToAutoComboOrder({
     body,
     promptText: input.prompt,
@@ -1061,24 +1104,43 @@ async function runGovernorE2E(pool, input, nativeKey) {
     routableCandidates: pool.candidates,
   });
   const planningMs = Math.round(performance.now() - planningStarted);
+  const planningCompletedAt = new Date().toISOString();
   const plan = runtime.context?.plan || null;
   const key = planTarget(plan);
+  const plannedTarget = key
+    ? resolvedTargetDescriptor(
+        pool.targets.find((target) => targetFromResolved(target).key === key)
+      )
+    : null;
+  const governorPlanOperationId = appendGovernorPlanOperation(artifactRun, {
+    pairId,
+    input,
+    order,
+    startedAt: planningStartedAt,
+    completedAt: planningCompletedAt,
+    planningMs,
+    plan,
+    plannedTarget,
+    failureClass: !plan || !key || plan.executable !== true ? "HARNESS_FAILURE" : null,
+    authoritative,
+  });
   if (!plan || !key || plan.executable !== true) {
     return {
       caseId: input.id,
       valid: false,
       reason: "governor_plan_not_executable",
+      failureClass: "HARNESS_FAILURE",
       planningMs,
       planningCorrelationId,
       e2eCompletionMs: Math.round(performance.now() - started),
+      governorPlanOperationId,
+      startedAt,
+      completedAt: new Date().toISOString(),
       plan,
     };
   }
   const [provider, ...modelParts] = key.split("/");
   const model = modelParts.join("/");
-  const plannedTarget = resolvedTargetDescriptor(
-    pool.targets.find((target) => targetFromResolved(target).key === key)
-  );
   const revalidation = await revalidateTarget(pool, provider, model);
   if (!revalidation.valid) {
     return {
@@ -1089,6 +1151,9 @@ async function runGovernorE2E(pool, input, nativeKey) {
       planningMs,
       planningCorrelationId,
       e2eCompletionMs: Math.round(performance.now() - started),
+      governorPlanOperationId,
+      startedAt,
+      completedAt: new Date().toISOString(),
       plan,
       plannedTarget,
       revalidation,
@@ -1121,13 +1186,34 @@ async function runGovernorE2E(pool, input, nativeKey) {
       : targetIdentity === "UNKNOWN"
         ? "HARNESS_FAILURE"
         : null;
+  const e2eCompletionMs = Math.round(performance.now() - started);
+  const governorOperationId = appendArmOperation(artifactRun, {
+    operationType: "governor_arm",
+    arm: "governor",
+    pairId,
+    caseId: input.id,
+    category: input.category,
+    order,
+    request: direct,
+    totalE2EMs: e2eCompletionMs,
+    startedAt: direct.startedAt || startedAt,
+    completedAt: direct.completedAt || new Date().toISOString(),
+    plannedTarget,
+    planningMs,
+    planningShare: e2eCompletionMs > 0 ? planningMs / e2eCompletionMs : null,
+    authoritative,
+  });
   return {
     caseId: input.id,
     valid: direct.status === 200 && direct.streamCompleted && identityFailureClass === null,
     failureClass: identityFailureClass || direct.failureClass,
     planningMs,
     planningCorrelationId,
-    e2eCompletionMs: Math.round(performance.now() - started),
+    e2eCompletionMs,
+    governorPlanOperationId,
+    governorOperationId,
+    startedAt,
+    completedAt: new Date().toISOString(),
     plan,
     plannedTarget,
     executedTarget,
@@ -1142,8 +1228,12 @@ async function runGovernorE2E(pool, input, nativeKey) {
   };
 }
 
-async function runNativeE2E(input) {
+async function runNativeE2E(
+  input,
+  { artifactRun = null, pairId = null, order = null, authoritative = false } = {}
+) {
   const started = performance.now();
+  const startedAt = new Date().toISOString();
   const requestResult = await request("auto/chat", input, "native-e2e");
   const plan = await readGovernorPlan(requestResult.correlationId);
   const observedTarget =
@@ -1164,6 +1254,22 @@ async function runNativeE2E(input) {
         ? "PASS"
         : "MISMATCH"
       : "UNKNOWN";
+  const e2eCompletionMs = Math.round(performance.now() - started);
+  const nativeOperationId = appendArmOperation(artifactRun, {
+    operationType: "native_arm",
+    arm: "native",
+    pairId,
+    caseId: input.id,
+    category: input.category,
+    order,
+    request: requestResult,
+    totalE2EMs: e2eCompletionMs,
+    startedAt: requestResult.startedAt || startedAt,
+    completedAt: requestResult.completedAt || new Date().toISOString(),
+    nativeFirstTarget,
+    nativeFinalTarget,
+    authoritative,
+  });
   return {
     caseId: input.id,
     valid:
@@ -1174,7 +1280,10 @@ async function runNativeE2E(input) {
         : targetIdentity === "UNKNOWN"
           ? "HARNESS_FAILURE"
           : requestResult.failureClass,
-    e2eCompletionMs: Math.round(performance.now() - started),
+    e2eCompletionMs,
+    nativeOperationId,
+    startedAt,
+    completedAt: new Date().toISOString(),
     routingOverheadMs: null,
     request: requestResult,
     plan,
@@ -1187,7 +1296,12 @@ async function runNativeE2E(input) {
   };
 }
 
-async function runE2E(pool, decisions, pairCount) {
+async function runE2E(
+  pool,
+  decisions,
+  pairCount,
+  { artifactRun = null, authoritative = false } = {}
+) {
   const usable = decisions
     .filter((decision) => decision.nativeTarget)
     .slice(0, Math.min(10, pairCount));
@@ -1195,19 +1309,30 @@ async function runE2E(pool, decisions, pairCount) {
   for (const [index, decision] of usable.entries()) {
     const input = DIVERGENCE_WORKLOAD.find((item) => item.id === decision.caseId);
     const governorFirst = index % 2 === 1;
+    const pairId = "pair-" + String(index + 1).padStart(2, "0");
+    const order = governorFirst ? "governor_then_native" : "native_then_governor";
     const nativeTarget = decision.nativeTarget;
-    const governorPromise = () => runGovernorE2E(pool, input, nativeTarget);
-    const nativePromise = () => runNativeE2E(input);
+    const governorPromise = () =>
+      runGovernorE2E(pool, input, nativeTarget, {
+        artifactRun,
+        pairId,
+        order,
+        authoritative,
+      });
+    const nativePromise = () => runNativeE2E(input, { artifactRun, pairId, order, authoritative });
     const first = governorFirst ? await governorPromise() : await nativePromise();
     const second = governorFirst ? await nativePromise() : await governorPromise();
     const native = governorFirst ? second : first;
     const governor = governorFirst ? first : second;
-    pairs.push({
+    const pair = {
+      pairId,
       caseId: decision.caseId,
-      order: governorFirst ? "governor_then_native" : "native_then_governor",
+      order,
       native,
       governor,
-    });
+    };
+    appendPairCompleteOperation(artifactRun, pair, input, authoritative);
+    pairs.push(pair);
   }
   return pairs;
 }
@@ -1292,6 +1417,7 @@ function compactRequest(request) {
     firstByteMs: request.firstByteMs,
     firstContentMs: request.firstContentMs,
     doneMs: request.doneMs,
+    readerCloseMs: request.readerCloseMs,
     completionMs: request.completionMs,
     streamEventCount: request.streamEventCount,
     responseModel: request.responseModel,
@@ -1302,6 +1428,205 @@ function compactRequest(request) {
     executedTarget: request.executedTarget,
     executedConnectionId: request.executedConnectionId,
   };
+}
+
+function operationTargetParts(target) {
+  const key = typeof target === "string" ? target : target?.target || null;
+  if (!key) return { provider: null, model: null, target: null };
+  const [provider, ...modelParts] = key.split("/");
+  return { provider, model: modelParts.join("/"), target: key };
+}
+
+function requestOperationFields(request, totalE2EMs) {
+  const executed = operationTargetParts(request?.executedTarget);
+  return {
+    httpStatus: request?.status ?? null,
+    headersMs: request?.headersAtMs ?? null,
+    firstByteMs: request?.firstByteMs ?? null,
+    firstContentMs: request?.firstContentMs ?? null,
+    doneMs: request?.doneMs ?? null,
+    readerCloseMs: request?.readerCloseMs ?? null,
+    completionMs: request?.completionMs ?? null,
+    totalE2EMs: totalE2EMs ?? null,
+    streamCompleted: request?.streamCompleted === true,
+    readerCompleted: request?.readerCompleted === true,
+    doneSeen: request?.doneMs != null,
+    streamEventCount: request?.streamEventCount ?? 0,
+    outputLength: request?.outputLength ?? 0,
+    outputPreview: request?.actualOutput ?? "",
+    outputTruncated: request?.outputTruncated === true,
+    validator: request?.qualityValidator ?? null,
+    qualityPass: request?.qualityPass === true,
+    qualityReason: request?.qualityReason ?? null,
+    failureClass: request?.failureClass ?? null,
+    attempts: Number.isFinite(request?.fallbackAttempts) ? request.fallbackAttempts + 1 : null,
+    fallbackCount: request?.fallbackAttempts ?? null,
+    requestCorrelationId: request?.requestCorrelationId ?? null,
+    responseCorrelationId: request?.responseCorrelationId ?? null,
+    requestId: request?.requestId ?? null,
+    executedProvider: executed.provider,
+    executedModel: executed.model,
+    executedTarget: executed.target,
+    executedConnectionId: request?.executedConnectionId ?? null,
+  };
+}
+
+function appendArmOperation(
+  run,
+  {
+    operationType,
+    arm,
+    pairId,
+    caseId,
+    category,
+    order,
+    request,
+    totalE2EMs,
+    startedAt,
+    completedAt,
+    plannedTarget,
+    nativeFirstTarget,
+    nativeFinalTarget,
+    planningMs,
+    planningShare,
+    authoritative,
+  }
+) {
+  if (!run) return null;
+  const planned = operationTargetParts(plannedTarget);
+  const nativeFirst = operationTargetParts(nativeFirstTarget);
+  const nativeFinal = operationTargetParts(nativeFinalTarget);
+  return run.appendOperation({
+    operationType,
+    arm,
+    pairId: pairId || null,
+    caseId,
+    category,
+    order: order || null,
+    authoritative: authoritative === true,
+    startedAt: startedAt || request?.startedAt || new Date().toISOString(),
+    completedAt: completedAt || request?.completedAt || new Date().toISOString(),
+    ...requestOperationFields(request, totalE2EMs),
+    plannedProvider: planned.provider,
+    plannedModel: planned.model,
+    plannedTarget: planned.target,
+    plannedConnectionId: plannedTarget?.connectionId || null,
+    nativeFirstProvider: nativeFirst.provider,
+    nativeFirstModel: nativeFirst.model,
+    nativeFirstTarget: nativeFirst.target,
+    nativeFinalProvider: nativeFinal.provider,
+    nativeFinalModel: nativeFinal.model,
+    nativeFinalTarget: nativeFinal.target,
+    planningMs: planningMs ?? null,
+    planningShare: planningShare ?? null,
+  });
+}
+
+function appendGovernorPlanOperation(
+  run,
+  {
+    pairId,
+    input,
+    order,
+    startedAt,
+    completedAt,
+    planningMs,
+    plan,
+    plannedTarget,
+    failureClass,
+    authoritative,
+  }
+) {
+  if (!run) return null;
+  const planned = operationTargetParts(plannedTarget);
+  return run.appendOperation({
+    operationType: "governor_plan",
+    arm: "governor",
+    pairId: pairId || null,
+    caseId: input.id,
+    category: input.category,
+    order: order || null,
+    authoritative: authoritative === true,
+    startedAt: startedAt || new Date().toISOString(),
+    completedAt: completedAt || new Date().toISOString(),
+    planningMs: planningMs ?? null,
+    planningShare: null,
+    plannedProvider: planned.provider,
+    plannedModel: planned.model,
+    plannedTarget: planned.target,
+    plannedConnectionId: plannedTarget?.connectionId || null,
+    executable: plan?.executable === true,
+    confidence: plan?.confidence || null,
+    guardrailResults: plan?.guardrailResults || null,
+    failureClass: failureClass || null,
+  });
+}
+
+function appendPairCompleteOperation(run, pair, input, authoritative) {
+  if (!run) return null;
+  const nativeRequest = pair.native.request;
+  const governorRequest = pair.governor.direct;
+  const nativeQuality = nativeRequest?.qualityPass === true;
+  const governorQuality = governorRequest?.qualityPass === true;
+  const qualityWinner =
+    nativeQuality === governorQuality ? "tie" : nativeQuality ? "native" : "governor";
+  const nativeSuccess = nativeRequest?.status === 200 && nativeRequest?.streamCompleted === true;
+  const governorSuccess =
+    governorRequest?.status === 200 && governorRequest?.streamCompleted === true;
+  const nativeE2E = pair.native.e2eCompletionMs;
+  const governorE2E = pair.governor.e2eCompletionMs;
+  const latencyWinner =
+    Number.isFinite(nativeE2E) && Number.isFinite(governorE2E)
+      ? nativeE2E === governorE2E
+        ? "tie"
+        : nativeE2E < governorE2E
+          ? "native"
+          : "governor"
+      : "tie";
+  const winner =
+    qualityWinner !== "tie"
+      ? qualityWinner
+      : nativeSuccess !== governorSuccess
+        ? nativeSuccess
+          ? "native"
+          : "governor"
+        : latencyWinner;
+  const operationId = run.appendOperation({
+    operationType: "pair_complete",
+    pairId: pair.pairId || "pair-" + input.id,
+    caseId: input.id,
+    category: input.category,
+    order: pair.order || null,
+    authoritative: authoritative === true,
+    startedAt: pair.startedAt || new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    nativeOperationId: pair.nativeOperationId || pair.native.nativeOperationId || null,
+    governorOperationIds: {
+      plan: pair.governorPlanOperationId || pair.governor.governorPlanOperationId || null,
+      arm: pair.governorOperationId || pair.governor.governorOperationId || null,
+    },
+    valid: pair.invalid !== true && pair.native.valid === true && pair.governor.valid === true,
+    winner: pair.pairwise?.winner || winner,
+    reason: pair.pairwise?.winnerReason || (qualityWinner !== "tie" ? "quality" : "latency"),
+    qualityWinner: pair.pairwise?.qualityWinner || qualityWinner,
+    latencyWinner: pair.pairwise?.latencyWinner || latencyWinner,
+    agreement:
+      pair.agreement ??
+      (pair.native.selectedTarget && pair.governor.selectedTarget
+        ? pair.native.selectedTarget === pair.governor.selectedTarget
+        : null),
+    nativeHttp: nativeRequest?.status ?? null,
+    governorHttp: governorRequest?.status ?? null,
+    nativeStreamCompleted: nativeRequest?.streamCompleted === true,
+    governorStreamCompleted: governorRequest?.streamCompleted === true,
+    governorPlanOperationId:
+      pair.governorPlanOperationId || pair.governor.governorPlanOperationId || null,
+    governorPlanExecutable: pair.governor.plan?.executable === true,
+    governorTargetIdentity: pair.governor.targetIdentity || null,
+    failureClass: pair.governor.failureClass || pair.native.failureClass || null,
+  });
+  pair.pairCompleteOperationId = operationId;
+  return operationId;
 }
 
 function compactE2E(pairs) {
@@ -1346,7 +1671,7 @@ function compactE2E(pairs) {
   });
 }
 
-async function runAuthoritativeNativePreflight(input) {
+async function runAuthoritativeNativePreflight(input, { artifactRun = null } = {}) {
   const requestResult = await request("auto/chat", input, "authoritative-target-preflight");
   const plan = await readGovernorPlan(requestResult.correlationId);
   const observedTarget =
@@ -1366,6 +1691,19 @@ async function runAuthoritativeNativePreflight(input) {
         ? "PASS"
         : "MISMATCH"
       : "UNKNOWN";
+  const nativePreflightOperationId = appendArmOperation(artifactRun, {
+    operationType: "native_preflight",
+    arm: "native",
+    caseId: input.id,
+    category: input.category,
+    request: requestResult,
+    totalE2EMs: null,
+    startedAt: requestResult.startedAt,
+    completedAt: requestResult.completedAt,
+    nativeFirstTarget: firstTarget,
+    nativeFinalTarget: finalTarget,
+    authoritative: true,
+  });
   return {
     caseId: input.id,
     nativeFirstTarget: firstTarget,
@@ -1381,6 +1719,7 @@ async function runAuthoritativeNativePreflight(input) {
           : requestResult.failureClass,
     request: requestResult,
     plan,
+    nativePreflightOperationId,
   };
 }
 
@@ -1476,7 +1815,13 @@ function buildAuthoritativePair(pairId, input, order, preflight, native, governo
   };
 }
 
-async function runAuthoritativePair(pool, input, preflight, pairIndex) {
+async function runAuthoritativePair(
+  pool,
+  input,
+  preflight,
+  pairIndex,
+  { artifactRun = null } = {}
+) {
   const nativeKey = preflight.nativeFinalTarget || preflight.nativeFirstTarget;
   if (!nativeKey) {
     return {
@@ -1493,20 +1838,26 @@ async function runAuthoritativePair(pool, input, preflight, pairIndex) {
   }
   const governorFirst = pairIndex % 2 === 1;
   const order = governorFirst ? "governor_then_native" : "native_then_governor";
-  const governorPromise = () => runGovernorE2E(pool, input, nativeKey);
-  const nativePromise = () => runNativeE2E(input);
+  const pairId = "pair-" + String(pairIndex + 1).padStart(2, "0");
+  const governorPromise = () =>
+    runGovernorE2E(pool, input, nativeKey, {
+      artifactRun,
+      pairId,
+      order,
+      authoritative: true,
+    });
+  const nativePromise = () =>
+    runNativeE2E(input, {
+      artifactRun,
+      pairId,
+      order,
+      authoritative: true,
+    });
   const first = governorFirst ? await governorPromise() : await nativePromise();
   const second = governorFirst ? await nativePromise() : await governorPromise();
   const native = governorFirst ? second : first;
   const governor = governorFirst ? first : second;
-  return buildAuthoritativePair(
-    `pair-${String(pairIndex + 1).padStart(2, "0")}`,
-    input,
-    order,
-    preflight,
-    native,
-    governor
-  );
+  return buildAuthoritativePair(pairId, input, order, preflight, native, governor);
 }
 
 function percentile(values, fraction) {
@@ -1777,12 +2128,84 @@ function calibrationRecoverySummary(pairs) {
   };
 }
 
-function outputDocument(result, { persist = false, kind = "diagnostic" } = {}) {
-  if (persist) {
-    const artifactPath = persistBenchmarkArtifact(result, { kind });
-    console.error(`[GOVERNOR] durable artifact=${artifactPath}`);
+function poolSnapshot(pool) {
+  return {
+    raw: pool.raw,
+    active: pool.active,
+    eligible: pool.eligible,
+    healthy: pool.healthy,
+    snapshotAt: pool.snapshotAt || null,
+    byProvider: pool.byProvider,
+    breakers: pool.breakers,
+    cooldowns: pool.cooldowns,
+    lockouts: pool.lockouts,
+  };
+}
+
+function createHarnessRun(pool, workload, requestedPairCount, authoritative) {
+  const run = createBenchmarkRun({
+    requestedPairs: requestedPairCount,
+    authoritative,
+    governorMode: "simulate",
+    governorActive: false,
+    canaryRate: 0,
+    runtimeBaseUrl: BASE_URL,
+    poolSnapshot: poolSnapshot(pool),
+    workloadHash: hashJson(workload.map(({ id, category, prompt }) => ({ id, category, prompt }))),
+    validatorHash: hashJson(
+      workload.map(
+        ({ id, category, validator, quality, expected, expectedJson, expectedFields }) => ({
+          id,
+          category,
+          validator: validator || quality || "exact",
+          expected: expectedJson ?? expectedFields ?? expected ?? null,
+        })
+      )
+    ),
+  });
+  activeBenchmarkRun = run;
+  const handler = (signal) => {
+    try {
+      run.markAborted(signal);
+    } catch (error) {
+      console.error("[GOVERNOR] failed to mark benchmark run aborted", error);
+    }
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  };
+  activeBenchmarkSignalHandler = handler;
+  process.once("SIGINT", handler);
+  process.once("SIGTERM", handler);
+  signalHandlersInstalled = true;
+  return run;
+}
+
+function clearBenchmarkRun() {
+  if (signalHandlersInstalled && activeBenchmarkRun) {
+    process.removeListener("SIGINT", activeBenchmarkSignalHandler);
+    process.removeListener("SIGTERM", activeBenchmarkSignalHandler);
   }
-  console.log(JSON.stringify(result, null, 2));
+  signalHandlersInstalled = false;
+  activeBenchmarkSignalHandler = null;
+  activeBenchmarkRun = null;
+}
+
+function outputDocument(
+  result,
+  { persist = false, kind = "diagnostic", artifactRun = null, status = "COMPLETE" } = {}
+) {
+  const resultWithRun = artifactRun ? { runId: artifactRun.manifest.runId, ...result } : result;
+  if (persist) {
+    const artifactPath = persistBenchmarkArtifact(
+      artifactRun ? { syntheticWorkload: true, ...resultWithRun } : resultWithRun,
+      { kind, outputPath: artifactRun?.finalSnapshotPath }
+    );
+    console.error(`[GOVERNOR] durable artifact=${artifactPath}`);
+    if (artifactRun) {
+      artifactRun.finalize({ status, finalSnapshotPath: artifactPath });
+      clearBenchmarkRun();
+    }
+  }
+  console.log(JSON.stringify(resultWithRun, null, 2));
 }
 
 const pool = await buildPool();
@@ -1827,6 +2250,7 @@ if (calibrationRecoveryOnly) {
   const decisions = replayLatestDecisionsFromTelemetry();
   const byCase = new Map(decisions.map((decision) => [decision.caseId, decision]));
   const calibrationDecisions = CALIBRATION_CASES.map(({ caseId }) => byCase.get(caseId));
+  const calibrationRun = createHarnessRun(pool, CALIBRATION_CASES, 3, false);
   if (calibrationDecisions.some((decision) => !decision?.nativeTarget)) {
     outputDocument(
       {
@@ -1839,11 +2263,19 @@ if (calibrationRecoveryOnly) {
           ({ caseId }) => !byCase.get(caseId)?.nativeTarget
         ).map(({ caseId }) => caseId),
       },
-      { persist: true, kind: "calibration-recovery" }
+      {
+        persist: true,
+        kind: "calibration-recovery",
+        artifactRun: calibrationRun,
+        status: "FAILED",
+      }
     );
     process.exit(2);
   }
-  const calibration = await runE2E(pool, calibrationDecisions, 3);
+  const calibration = await runE2E(pool, calibrationDecisions, 3, {
+    artifactRun: calibrationRun,
+    authoritative: false,
+  });
   const summary = calibrationRecoverySummary(calibration);
   outputDocument(
     {
@@ -1859,7 +2291,12 @@ if (calibrationRecoveryOnly) {
       calibration: compactE2E(calibration),
       summary,
     },
-    { persist: true, kind: "calibration-recovery" }
+    {
+      persist: true,
+      kind: "calibration-recovery",
+      artifactRun: calibrationRun,
+      status: summary.calibrationPassed ? "COMPLETE" : "FAILED",
+    }
   );
   process.exit(summary.calibrationPassed ? 0 : 2);
 }
@@ -1869,9 +2306,10 @@ if (authoritativeOnly) {
     Math.max(5, Number.isInteger(requestedPairs) ? requestedPairs : 10)
   );
   const workload = AUTHORITATIVE_WORKLOAD.slice(0, pairLimit);
+  const authoritativeRun = createHarnessRun(pool, workload, pairLimit, true);
   const preflight = [];
   for (const input of workload) {
-    preflight.push(await runAuthoritativeNativePreflight(input));
+    preflight.push(await runAuthoritativeNativePreflight(input, { artifactRun: authoritativeRun }));
   }
   const missingPreflight = preflight.filter((item) => !item.nativeFinalTarget || !item.valid);
   if (missingPreflight.length > 0) {
@@ -1912,14 +2350,22 @@ if (authoritativeOnly) {
         fivePairGate: { pass: false, reason: "authoritative_native_target_preflight_failed" },
         stopReason: "BENCHMARK_INVALID",
       },
-      { persist: true, kind: "authoritative" }
+      {
+        persist: true,
+        kind: "authoritative",
+        artifactRun: authoritativeRun,
+        status: "FAILED",
+      }
     );
     process.exit(2);
   }
 
   const pairs = [];
   for (let index = 0; index < workload.length; index += 1) {
-    const pair = await runAuthoritativePair(pool, workload[index], preflight[index], index);
+    const pair = await runAuthoritativePair(pool, workload[index], preflight[index], index, {
+      artifactRun: authoritativeRun,
+    });
+    appendPairCompleteOperation(authoritativeRun, pair, workload[index], true);
     pairs.push(pair);
     if (index === 4 && pairLimit > 5) {
       const fivePairGate = gateForFivePairs(pairs.slice(0, 5));
@@ -1943,7 +2389,12 @@ if (authoritativeOnly) {
             pairwise: authoritativePairwise(pairs),
             stopReason: "FIVE_PAIR_GATE_FAILED",
           },
-          { persist: true, kind: "authoritative" }
+          {
+            persist: true,
+            kind: "authoritative",
+            artifactRun: authoritativeRun,
+            status: "FAILED",
+          }
         );
         process.exit(2);
       }
@@ -2036,7 +2487,12 @@ if (authoritativeOnly) {
       decisionBenchmark: "INCONCLUSIVE",
       canaryReadiness: "NOT_READY",
     },
-    { persist: true, kind: "authoritative" }
+    {
+      persist: true,
+      kind: "authoritative",
+      artifactRun: authoritativeRun,
+      status: fivePairGate.pass ? "COMPLETE" : "FAILED",
+    }
   );
   process.exit(fivePairGate.pass ? 0 : 2);
 }

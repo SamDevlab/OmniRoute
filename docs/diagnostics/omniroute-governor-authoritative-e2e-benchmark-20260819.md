@@ -241,17 +241,32 @@ latency aggregates. Governor remains `simulate / false / 0`.
 
 ## Durable artifact contract
 
-The prior run did not retain a complete JSON artifact. The harness now persists the complete
-authoritative result before printing it, including raw per-arm output, quality reason, headers,
-first-byte/first-content timing, `doneMs`, completion timing, reader/event state, correlation IDs,
-target identity, `planningMs`, planning share, and accounting. The writer is atomic and converts
-`Map` state to JSON objects so terminal truncation cannot erase the diagnostic record.
+The prior run did not retain a complete JSON artifact. The harness now creates a unique run directory
+before the first benchmark request. It writes `manifest.json`, appends each completed
+`native_preflight`, `native_arm`, `governor_plan`, `governor_arm`, and `pair_complete` operation to
+`operations.jsonl` with a durable append, and writes `summary.json` only after normal finalization.
+This preserves completed pairs if stdout disappears or the process dies before the final pair.
+
+The final all-in-one snapshot remains available as `final-snapshot.json` and includes bounded raw
+per-arm output, quality reason, headers, first-byte/first-content timing, `doneMs`, reader-close and
+completion timing, reader/event state, correlation IDs, target identity, `planningMs`, planning
+share, and accounting. The writer is atomic and converts `Map` state to JSON objects. Persisted
+output previews are capped at 4096 UTF-8 bytes.
+
+An offline summarizer reconstructs status, completed pairs, accounting, quality, pairwise results,
+timings, planning, and warnings from `manifest.json` and `operations.jsonl` alone. A malformed last
+line is reported as MALFORMED_OPERATION_RECORD and cannot produce COMPLETE. SIGINT/SIGTERM marks
+the manifest ABORTED without fabricating a summary; an abrupt crash leaves RUNNING, which the
+summarizer classifies as INCOMPLETE_RUN.
 
 - Writer: `scripts/ad-hoc/omniroute-governor-benchmark-persistence.mjs`
-- Default directory: `docs/diagnostics/governor-e2e-artifacts/`
+- Run directory root: `docs/diagnostics/governor-e2e-artifacts/`
+- Offline summarizer: `scripts/ad-hoc/omniroute-governor-run-summarizer.mjs`
 - Optional destination: `OMNIROUTE_GOVERNOR_E2E_OUTPUT`
+- Optional run root: `OMNIROUTE_GOVERNOR_E2E_ARTIFACT_ROOT`
 - Artifact schema: `1`
 - Authoritative and calibration-recovery paths persist both successful and failed gate results.
+- Runtime run directories are ignored and must not be committed as real benchmark artifacts.
 
 This persistence change was validated without executing another benchmark. The Governor remains
 `simulate / false / 0` with canary `0`; a future benchmark still requires separate approval.

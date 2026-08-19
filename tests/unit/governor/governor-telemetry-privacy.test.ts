@@ -44,7 +44,7 @@ describe("Governor Telemetry Privacy & Resilience", () => {
       apiKey: "sk-test-governor-secret-canary",
       authorization: "Bearer governor-secret-canary",
       toolOutputBody: "tool output governor-secret-canary",
-      responseBody: "response governor-secret-canary",
+      responseBody: "response SENSITIVE_RESPONSE_SENTINEL governor-secret-canary",
     } as unknown as GovernorTelemetry;
 
     insertGovernorTelemetryRow(canaryRequest);
@@ -68,6 +68,7 @@ describe("Governor Telemetry Privacy & Resilience", () => {
           .all("priv-test-101")
       );
       assert.equal(serializedStored.includes("governor-secret-canary"), false);
+      assert.equal(serializedStored.includes("SENSITIVE_RESPONSE_SENTINEL"), false);
       assert.equal(serializedStored.includes("sk-test-governor-secret-canary"), false);
       assert.equal(serializedStored.includes("Bearer governor-secret-canary"), false);
     }
@@ -76,6 +77,8 @@ describe("Governor Telemetry Privacy & Resilience", () => {
   it("real active runtime keeps request secret canaries out of context and telemetry", async () => {
     const oldEnv = { ...process.env };
     const secretFragments = [
+      "SENSITIVE_PROMPT_SENTINEL",
+      "SENSITIVE_RESPONSE_SENTINEL",
       "sk-governor-final-secret",
       "Bearer governor-final-secret",
       "password=governor-final-secret",
