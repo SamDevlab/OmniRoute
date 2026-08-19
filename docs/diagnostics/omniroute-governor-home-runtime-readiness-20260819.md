@@ -2,7 +2,9 @@
 
 ## Final status
 
-`E — METHODOLOGY_BLOCKER`
+Readiness outcome: `E — METHODOLOGY_BLOCKER`
+
+Final handoff status after the documentation/tooling push: `G — CI_PENDING`.
 
 The local Governor runtime is ready in `simulate / false / 0` and the offline
 planning gate passed `10/10`, but the authoritative Native preflight has a
@@ -19,7 +21,8 @@ PR: `SamDevlab/OmniRoute#12` (existing PR; no new PR and no merge)
 
 ## CI gate
 
-Final `gh pr checks 12 --repo SamDevlab/OmniRoute` result:
+Pre-push `gh pr checks 12 --repo SamDevlab/OmniRoute` result used for the
+readiness gate:
 
 | Check                              | Result                              |
 | ---------------------------------- | ----------------------------------- |
@@ -32,7 +35,11 @@ Final `gh pr checks 12 --repo SamDevlab/OmniRoute` result:
 
 Other fast-path jobs were also `SKIPPED` by the workflow. `CI_GATE = PASS`.
 The first observation had Fast Production Build pending; it completed before
-the final check.
+the pre-push final check. The subsequent push of this report and diagnostic
+tooling started a new PR workflow. The post-push check is currently pending for
+Change Classification, Semgrep, DAST smoke, and Fast Production Build; the
+Merge integrity check is currently skipped as expected. Per the hard stop rule,
+the final handoff status is therefore `G — CI_PENDING`.
 
 ## Governor mode resolution
 
