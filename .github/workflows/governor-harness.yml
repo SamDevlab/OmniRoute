@@ -52,7 +52,9 @@ jobs:
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
-      - run: npm ci
+      # Use the repository's hardened retry wrapper. The harness lane initially used bare
+      # `npm ci` and false-red on an onnxruntime-node binary download timeout before tests ran.
+      - uses: ./.github/actions/npm-ci-retry
 
       - name: Diagnostic script syntax
         run: |
