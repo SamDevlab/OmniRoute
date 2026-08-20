@@ -186,7 +186,10 @@ test("virtual OpenCode execution keys normalize to canonical provider/model with
   assert.equal(result.nativeBaselineCanonicalTarget, "opencode/big-pickle");
   assert.equal(result.nativeBaselineTarget, "opencode/big-pickle");
   assert.equal(result.nativeBaselineConnection, "noauth");
-  assert.equal(result.nativeBaselineCandidateOrder[0].executionKey, "virtual-auto-default-1-opencode");
+  assert.equal(
+    result.nativeBaselineCandidateOrder[0].executionKey,
+    "virtual-auto-default-1-opencode"
+  );
   assert.equal(result.nativeBaselineCandidateOrder[0].canonicalTarget, "opencode/big-pickle");
 });
 

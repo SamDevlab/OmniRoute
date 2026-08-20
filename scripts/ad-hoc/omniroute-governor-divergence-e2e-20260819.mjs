@@ -389,7 +389,9 @@ function targetKey(provider, model) {
 }
 
 function normalizeTarget(provider, model) {
-  return canonicalTargetKey(provider, model) || targetKey(provider || "unknown", model || "unknown");
+  return (
+    canonicalTargetKey(provider, model) || targetKey(provider || "unknown", model || "unknown")
+  );
 }
 
 function targetFromResolved(target) {
@@ -852,8 +854,7 @@ async function revalidateTarget(pool, provider, model) {
     connectionChecks.length > 0 && connectionChecks.every((check) => check.unavailableStatus);
   const candidateEligible = candidates.some((candidate) => candidate.quotaCutoffBlocked !== true);
   const candidateHealthy = candidates.some(
-    (candidate) =>
-      candidate.circuitBreakerState !== "OPEN" && candidate.statusPenalty !== true
+    (candidate) => candidate.circuitBreakerState !== "OPEN" && candidate.statusPenalty !== true
   );
   const guardrails = {
     active: true,
@@ -1116,7 +1117,8 @@ async function runGovernorE2E(
   const baselineLookup = resolveNativeBaselinePoolTarget(pool.targets, baselineReference);
   const nativeTargetResolved = baselineLookup.target;
   if (!nativeTargetResolved) {
-    const failureReason = baselineLookup.failureReason || "NATIVE_BASELINE_TARGET_NOT_IN_CURRENT_POOL";
+    const failureReason =
+      baselineLookup.failureReason || "NATIVE_BASELINE_TARGET_NOT_IN_CURRENT_POOL";
     const governorPlanOperationId = appendGovernorPlanOperation(artifactRun, {
       pairId,
       input,
@@ -2231,8 +2233,7 @@ function gateForFivePairs(pairs) {
   const identityPass =
     pairs.length === 5 &&
     pairs.every(
-      (pair) =>
-        pair.native?.targetIdentity === "PASS" && pair.governor?.targetIdentity === "PASS"
+      (pair) => pair.native?.targetIdentity === "PASS" && pair.governor?.targetIdentity === "PASS"
     );
   // A real MODEL_QUALITY_FAILURE is a measured experimental outcome, not a methodology failure.
   // Require both validators to have produced boolean measurements, but do not require them true.

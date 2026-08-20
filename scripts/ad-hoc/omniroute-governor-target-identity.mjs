@@ -46,7 +46,9 @@ export function targetIdentityFromResolved(target) {
   const canonicalTarget = model ? canonicalTargetKey(provider, model) : null;
   const allowedConnectionIds = [
     cleanString(target.connectionId),
-    ...(Array.isArray(target.allowedConnectionIds) ? target.allowedConnectionIds.map(cleanString) : []),
+    ...(Array.isArray(target.allowedConnectionIds)
+      ? target.allowedConnectionIds.map(cleanString)
+      : []),
   ].filter(Boolean);
   return {
     executionKey: cleanString(target.executionKey) || cleanString(target.stepId),
@@ -172,7 +174,9 @@ export function resolvePlanTargetDescriptor(targets, canonicalTarget) {
     .filter(({ identity }) => identity.canonicalTarget === key);
   if (matches.length === 0) return null;
 
-  const connections = [...new Set(matches.flatMap(({ identity }) => identity.allowedConnectionIds))];
+  const connections = [
+    ...new Set(matches.flatMap(({ identity }) => identity.allowedConnectionIds)),
+  ];
   const directConnections = [
     ...new Set(matches.map(({ identity }) => identity.connectionId).filter(Boolean)),
   ];

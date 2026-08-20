@@ -42,10 +42,7 @@ test("canonical identity preserves internal execution key but normalizes OpenCod
 });
 
 test("canonical identity preserves provider-owned slash model IDs", () => {
-  assert.equal(
-    canonicalTargetKey("nvidia", "openai/gpt-oss-20b"),
-    "nvidia/openai/gpt-oss-20b"
-  );
+  assert.equal(canonicalTargetKey("nvidia", "openai/gpt-oss-20b"), "nvidia/openai/gpt-oss-20b");
 });
 
 test("baseline lookup prefers exact execution key and verifies its canonical identity", () => {
