@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 
 const payload = JSON.parse(readFileSync(0, "utf8"));
-// Force the production DB layer onto its in-memory/cloud branch before any DB module is imported.
+// Keep production DB reads isolated from the parent process before any DB module is imported.
 // The parent process remains on the household DB; this child cannot open or mutate it.
 globalThis.caches = {};
 const { resolveAutoStrategyOrder } =

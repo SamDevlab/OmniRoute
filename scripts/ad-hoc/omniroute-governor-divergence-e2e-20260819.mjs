@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 
 import { queryGovernorTelemetryRows } from "../../src/lib/db/governorTelemetry.ts";
-import { getCachedProviderConnections } from "../../src/lib/db/readCache.ts";
+import { getCachedProviderConnections, getCachedSettings } from "../../src/lib/db/readCache.ts";
 import { getCallLogs } from "../../src/lib/usage/callLogs.ts";
 import { getResolvedModelCapabilities } from "../../src/lib/modelCapabilities.ts";
 import { getCircuitBreaker } from "../../src/shared/utils/circuitBreaker.ts";
 import { getModelLockoutInfo } from "../../open-sse/services/accountFallback.ts";
 import { getGovernorMode } from "../../src/shared/utils/featureFlags.ts";
 import { applyGovernorToAutoComboOrder } from "../../open-sse/governor/autoComboRuntime.ts";
+import { resolveGovernorPricingEvidence } from "../../open-sse/governor/autoComboRuntime.ts";
 import { estimateFinalInputTokens } from "../../open-sse/handlers/chatCore/contextEstimation.ts";
 import { buildAutoCandidates } from "../../open-sse/services/combo.ts";
 import { scoreAutoTargets } from "../../open-sse/services/combo/autoStrategy.ts";
@@ -354,6 +355,24 @@ function evaluateAuthoritativeQuality(input, content) {
   return qualityResult(input, content, pass, reason, input.expected);
 }
 
+function requestBodyForInput(model, input) {
+  const configured =
+    input?.requestBody && typeof input.requestBody === "object" && !Array.isArray(input.requestBody)
+      ? input.requestBody
+      : {};
+  const defaultMessages = [{ role: "user", content: input?.prompt || "" }];
+  return {
+    model,
+    messages: defaultMessages,
+    stream: true,
+    temperature: 0,
+    max_tokens: MAX_TOKENS,
+    ...configured,
+    model,
+    messages: configured.messages || defaultMessages,
+  };
+}
+
 function header(response, name) {
   return response.headers.get(name) || response.headers.get(name.toLowerCase()) || null;
 }
@@ -510,13 +529,7 @@ export async function request(model, input, armLabel) {
         "X-Correlation-Id": requestCorrelationId,
       },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: input.prompt }],
-        stream: true,
-        temperature: 0,
-        max_tokens: MAX_TOKENS,
-      }),
+      body: JSON.stringify(requestBodyForInput(model, input)),
     });
     const headersAt = performance.now();
     const stream = await readStreamingBody(response, input, started);
@@ -649,6 +662,7 @@ function candidateDetails(pool, provider, model) {
 
 async function buildPool() {
   const virtualCombo = await createVirtualAutoCombo(undefined);
+  const routingSettings = await getCachedSettings().catch(() => ({}));
   const targets = virtualCombo.models.map((item) => ({
     kind: "model",
     stepId: item.id,
@@ -686,6 +700,7 @@ async function buildPool() {
         provider: candidate.provider,
         model: candidate.model,
       });
+      const pricing = await resolveGovernorPricingEvidence(candidate.provider, candidate.model);
       const score = scored.find(
         (entry) => candidateKey(candidate) === targetFromResolved(entry.target).key
       );
@@ -693,6 +708,7 @@ async function buildPool() {
         provider: candidate.provider,
         model: candidate.model,
         score: finite(score?.score),
+        pricing: pricing.pricingKnown ? "known" : "unknown",
         contextWindow: capabilities.contextWindow ?? null,
         capabilities: {
           tools: capabilities.toolCalling || capabilities.supportsTools === true,
@@ -754,6 +770,7 @@ async function buildPool() {
     }));
   return {
     virtualCombo,
+    routingSettings,
     targets,
     candidates,
     scored,
@@ -1100,12 +1117,7 @@ async function runGovernorE2E(
       completedAt: new Date().toISOString(),
     };
   }
-  const body = {
-    model: "auto/chat",
-    messages: [{ role: "user", content: input.prompt }],
-    stream: true,
-    max_tokens: MAX_TOKENS,
-  };
+  const body = requestBodyForInput("auto/chat", input);
   const planningStarted = performance.now();
   const planningStartedAt = new Date().toISOString();
   const planningCorrelationId = "e2e-governor-" + input.id + "-" + randomUUID();
@@ -1376,7 +1388,7 @@ async function runE2E(
     const governorFirst = index % 2 === 1;
     const pairId = "pair-" + String(index + 1).padStart(2, "0");
     const order = governorFirst ? "governor_then_native" : "native_then_governor";
-    const nativeTarget = decision.nativeTarget;
+    const nativeTarget = decision.nativeBaselineTarget || decision.nativeTarget;
     const governorPromise = () =>
       runGovernorE2E(pool, input, nativeTarget, {
         artifactRun,
@@ -1384,7 +1396,17 @@ async function runE2E(
         order,
         authoritative,
       });
-    const nativePromise = () => runNativeE2E(input, { artifactRun, pairId, order, authoritative });
+    const nativePromise = () =>
+      runNativeE2E(input, {
+        artifactRun,
+        pairId,
+        order,
+        authoritative,
+        nativeBaselineTarget: decision.nativeBaselineTarget || null,
+        nativeBaselineConnection: decision.nativeBaselineConnection || null,
+        baselineSnapshotId: decision.baselineSnapshotId || null,
+        baselineSnapshotHash: decision.baselineSnapshotHash || null,
+      });
     const first = governorFirst ? await governorPromise() : await nativePromise();
     const second = governorFirst ? await nativePromise() : await governorPromise();
     const native = governorFirst ? second : first;
@@ -1395,6 +1417,9 @@ async function runE2E(
       order,
       native,
       governor,
+      nativeBaselineTarget: decision.nativeBaselineTarget || null,
+      baselineSnapshotId: decision.baselineSnapshotId || null,
+      baselineSnapshotHash: decision.baselineSnapshotHash || null,
     };
     appendPairCompleteOperation(artifactRun, pair, input, authoritative);
     pairs.push(pair);
@@ -1792,11 +1817,23 @@ function compactE2E(pairs) {
   });
 }
 
-async function resolveAuthoritativeNativeBaseline(input, snapshot, { artifactRun = null } = {}) {
+async function resolveAuthoritativeNativeBaseline(
+  input,
+  snapshot,
+  { artifactRun = null, authoritative = true } = {}
+) {
+  const beforeDigest = nativeBaselineStateDigest(snapshot);
+  const startedAt = new Date().toISOString();
   const resolution = resolveNativeBaselineWithoutExecution({
     snapshot,
-    request: nativeBaselineRequest(input.id, input.prompt),
+    request: nativeBaselineRequest(
+      input.id,
+      input.prompt,
+      input.requestBody && typeof input.requestBody === "object" ? input.requestBody : {}
+    ),
   });
+  const afterDigest = nativeBaselineStateDigest(snapshot);
+  const completedAt = new Date().toISOString();
   const baselineTarget = resolution.nativeBaselineTarget || null;
   const baselineOperationId = artifactRun?.appendOperation({
     operationType: "native_baseline_resolution",
@@ -1804,9 +1841,9 @@ async function resolveAuthoritativeNativeBaseline(input, snapshot, { artifactRun
     caseId: input.id,
     category: input.category,
     order: null,
-    authoritative: true,
-    startedAt: new Date().toISOString(),
-    completedAt: new Date().toISOString(),
+    authoritative,
+    startedAt,
+    completedAt,
     nativeBaselineProvider: resolution.nativeBaselineProvider || null,
     nativeBaselineModel: resolution.nativeBaselineModel || null,
     nativeBaselineConnection: resolution.nativeBaselineConnection || null,
@@ -1821,8 +1858,8 @@ async function resolveAuthoritativeNativeBaseline(input, snapshot, { artifactRun
     governorProviderModelPreflightRequests: 0,
     networkCalls: resolution.networkCalls,
     routingStateMutation: false,
-    homeStateDigestBefore: nativeBaselineStateDigest(snapshot),
-    homeStateDigestAfter: nativeBaselineStateDigest(snapshot),
+    homeStateDigestBefore: beforeDigest,
+    homeStateDigestAfter: afterDigest,
     valid: resolution.valid === true,
     failureClass: resolution.valid ? null : "NATIVE_BASELINE_RESOLUTION_FAILED",
     failureReason: resolution.error || null,
@@ -1841,13 +1878,34 @@ async function resolveAuthoritativeNativeBaseline(input, snapshot, { artifactRun
     providerModelRequests: 0,
     networkCalls: resolution.networkCalls,
     routingStateMutation: false,
-    homeStateDigestBefore: nativeBaselineStateDigest(snapshot),
-    homeStateDigestAfter: nativeBaselineStateDigest(snapshot),
+    homeStateDigestBefore: beforeDigest,
+    homeStateDigestAfter: afterDigest,
     valid: resolution.valid === true && Boolean(baselineTarget),
     failureClass: resolution.valid ? null : "NATIVE_BASELINE_RESOLUTION_FAILED",
     failureReason: resolution.error || null,
     baselineOperationId,
   };
+}
+
+async function resolveOfflineNativeBaselines(
+  pool,
+  workload,
+  { artifactRun = null, authoritative = false } = {}
+) {
+  const snapshot = await createNativeBaselineSnapshot({
+    pool,
+    routingSettings: pool.routingSettings,
+  });
+  const baselines = [];
+  for (const input of workload) {
+    baselines.push(
+      await resolveAuthoritativeNativeBaseline(input, snapshot, {
+        artifactRun,
+        authoritative,
+      })
+    );
+  }
+  return { snapshot, baselines };
 }
 
 function buildAuthoritativePair(pairId, input, order, baseline, native, governor) {
@@ -2409,20 +2467,63 @@ if (directOnly || replayOnly) {
   process.exit(0);
 }
 if (calibrationRecoveryOnly) {
-  const decisions = replayLatestDecisionsFromTelemetry();
-  const byCase = new Map(decisions.map((decision) => [decision.caseId, decision]));
-  const calibrationDecisions = CALIBRATION_CASES.map(({ caseId }) => byCase.get(caseId));
   const calibrationRun = createHarnessRun(pool, CALIBRATION_CASES, 3, false);
-  if (calibrationDecisions.some((decision) => !decision?.nativeTarget)) {
+  const calibrationInputs = CALIBRATION_CASES.map(({ caseId }) =>
+    DIVERGENCE_WORKLOAD.find((input) => input.id === caseId)
+  ).filter(Boolean);
+  const { snapshot: calibrationSnapshot, baselines: calibrationBaselines } =
+    await resolveOfflineNativeBaselines(pool, calibrationInputs, {
+      artifactRun: calibrationRun,
+      authoritative: false,
+    });
+  calibrationRun.updateManifest({
+    nativeBaselineResolution: "side_effect_free",
+    baselineSnapshotId: calibrationSnapshot.snapshotId,
+    baselineSnapshotHash: calibrationSnapshot.baselineSnapshotHash,
+    nativeBaselineProviderModelRequests: 0,
+    governorProviderModelPreflightRequests: 0,
+    sideEffectFreeBaselineResolutions: calibrationBaselines.length,
+    preflightStateContamination: calibrationBaselines.every(
+      (item) =>
+        item.valid === true &&
+        item.networkCalls === 0 &&
+        item.providerModelRequests === 0 &&
+        item.routingStateMutation === false &&
+        item.homeStateDigestBefore === item.homeStateDigestAfter
+    )
+      ? "NO"
+      : "YES",
+  });
+  const calibrationDecisions = calibrationInputs.map((input, index) => {
+    const baseline = calibrationBaselines[index];
+    return {
+      caseId: input.id,
+      category: input.category,
+      nativeTarget: baseline.nativeBaselineTarget,
+      nativeBaselineTarget: baseline.nativeBaselineTarget,
+      nativeBaselineConnection: baseline.nativeBaselineConnection,
+      baselineSnapshotId: baseline.baselineSnapshotId,
+      baselineSnapshotHash: baseline.baselineSnapshotHash,
+      nativeProven: baseline.valid === true,
+    };
+  });
+  if (
+    calibrationDecisions.length !== CALIBRATION_CASES.length ||
+    calibrationDecisions.some((decision) => !decision.nativeTarget)
+  ) {
     outputDocument(
       {
         governor: "simulate / false / 0",
         canary: 0,
+        nativeBaseline: calibrationBaselines,
+        baselineSnapshotId: calibrationSnapshot.snapshotId,
+        baselineSnapshotHash: calibrationSnapshot.baselineSnapshotHash,
         calibration: [],
         calibrationPassed: false,
-        stopReason: "calibration_native_target_unproven",
+        stopReason: "calibration_native_baseline_unproven",
         missingCases: CALIBRATION_CASES.filter(
-          ({ caseId }) => !byCase.get(caseId)?.nativeTarget
+          ({ caseId }) =>
+            !calibrationDecisions.find((decision) => decision.caseId === caseId)?.nativeTarget
         ).map(({ caseId }) => caseId),
       },
       {
@@ -2450,6 +2551,9 @@ if (calibrationRecoveryOnly) {
         healthy: pool.healthy,
         byProvider: pool.byProvider,
       },
+      nativeBaseline: calibrationBaselines,
+      baselineSnapshotId: calibrationSnapshot.snapshotId,
+      baselineSnapshotHash: calibrationSnapshot.baselineSnapshotHash,
       calibration: compactE2E(calibration),
       summary,
     },
@@ -2469,7 +2573,10 @@ if (authoritativeOnly) {
   );
   const workload = AUTHORITATIVE_WORKLOAD.slice(0, pairLimit);
   const authoritativeRun = createHarnessRun(pool, workload, pairLimit, true);
-  const baselineSnapshot = await createNativeBaselineSnapshot({ pool });
+  const baselineSnapshot = await createNativeBaselineSnapshot({
+    pool,
+    routingSettings: pool.routingSettings,
+  });
   authoritativeRun.updateManifest({
     nativeBaselineResolution: "side_effect_free",
     baselineSnapshotId: baselineSnapshot.snapshotId,

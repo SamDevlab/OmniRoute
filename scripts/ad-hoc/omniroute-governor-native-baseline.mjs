@@ -66,6 +66,7 @@ function pickRoutingSettings(settings) {
     "intentExtraReasoningKeywords",
     "intentExtraSimpleKeywords",
     "compatFilterFailOpen",
+    "complexityAwareRouting",
   ];
   return Object.fromEntries(
     keys.filter((key) => source[key] !== undefined).map((key) => [key, jsonClone(source[key])])
@@ -226,8 +227,10 @@ export function nativeBaselineRequest(caseId, prompt, extra = {}) {
       model: "auto/chat",
       messages: [{ role: "user", content: prompt }],
       stream: true,
+      temperature: 0,
       max_tokens: 128,
-      ...extra,
+      ...jsonClone(extra),
+      model: "auto/chat",
     },
   };
 }

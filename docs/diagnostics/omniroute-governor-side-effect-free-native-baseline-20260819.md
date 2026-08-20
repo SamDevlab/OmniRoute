@@ -39,8 +39,8 @@ The authoritative path now:
 1. builds one frozen Native routing snapshot before Pair 1;
 2. resolves each workload's initial Native choice with
    `open-sse/services/combo/resolveAutoStrategy.ts::resolveAutoStrategyOrder`;
-3. runs that production resolver in a child process with an in-memory DB branch and Governor
-   forced off;
+3. runs that production resolver in a child process with an isolated temporary data directory
+   and Governor forced off; the household DB is never opened by the resolver process;
 4. injects the frozen candidates into the production resolver; and
 5. intercepts `fetch` so any attempted network call fails and is counted.
 
@@ -60,6 +60,11 @@ The snapshot contains:
 - model lockouts;
 - active connection state and allowed connection identities; and
 - routing configuration plus resilience settings used by the resolver.
+
+The request contract is preserved between the baseline and a future Native arm. It includes the
+same `model`, messages/system context, stream flag, temperature, output budget, tools,
+`response_format`, and any explicitly supplied routing-context fields. The baseline never adds
+an expected output or validator-only field to routing input.
 
 Pricing evidence is not read or used by the corrected baseline path.
 
@@ -91,22 +96,58 @@ The offline summarizer accepts the new operation and continues to read historica
 `native_preflight` records only for backward-compatible diagnosis. New authoritative runs do
 not emit that legacy operation type.
 
+`--calibration-recovery` now resolves its three Native targets from the same side-effect-free
+snapshot instead of replaying a target obtained from a historical live preflight. AB/BA order
+and the later model-facing calibration arms remain unchanged when that mode is explicitly run.
+
 ## Validation evidence
 
-Focused validation passed:
+Consolidated focused validation passed:
 
 ```text
 node --import tsx/esm --test \
 tests/unit/omniroute-governor-native-baseline.test.ts \
-  tests/unit/omniroute-governor-divergence-e2e-harness.test.ts
-17 passed, 0 failed
+tests/unit/omniroute-governor-divergence-e2e-harness.test.ts \
+tests/unit/omniroute-governor-incomplete-pair-harness.test.ts \
+tests/unit/omniroute-shadow-benchmark-methodology.test.ts \
+tests/unit/governor/governor-feature-flags-and-failures.test.ts \
+tests/unit/governor/governor-shadow-isolation.test.ts \
+tests/unit/governor/governor-telemetry-privacy.test.ts \
+tests/unit/governor/runtime-closure.test.ts \
+tests/unit/governor/simulate-feature-flag.test.ts \
+tests/unit/governor/counterfactual-telemetry.test.ts \
+tests/unit/governor/stream-observability.test.ts
+55 passed, 0 failed
 ```
+
+The first combined invocation inherited the household Governor feature-flag database and
+reported `51 passed, 4 failed`: the four failures expected a clean default `off`/active-canary
+state, while the household database contains the intentional `simulate` override. The four
+affected files were then rerun sequentially with a temporary `DATA_DIR`; all 19 tests passed
+there. Together with the other 36 focused tests, the isolated focused gate is `55 passed, 0
+failed`. The household database was not changed by this correction.
 
 The tests prove the resolver uses the production function, preserves provider/model/connection
 identity and routing sentinels, makes zero network calls, makes zero provider/model requests,
 keeps the state digest equal before/after, rejects baseline drift/unproven first actuals, and
 lets `summarizeBenchmarkRun` reconstruct one side-effect-free resolution with zero physical
 preflights.
+
+The offline readiness fixture independently resolved ten frozen workloads and planned all ten
+Governor counterfactuals without model execution:
+
+```text
+NATIVE_BASELINES=10/10
+GOVERNOR_PLANS=10/10
+GOVERNOR_EXECUTABLE=10/10
+NETWORK_REQUESTS=0
+PROVIDER_MODEL_REQUESTS=0
+```
+
+The focused fixture matrix also covers single/multiple targets, provider/model and connection
+identity, capability/request-contract fields, healthy versus circuit-open/status-penalized
+candidates, cooldown/lockout sentinels, quota exhaustion, and unknown/free pricing behavior in
+the existing Governor planner tests. No pricing or ranking semantics were changed.
 
 The offline CLI proof also passed against a synthetic persisted run:
 

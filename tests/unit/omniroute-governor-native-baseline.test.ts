@@ -15,6 +15,9 @@ import {
   summarizeBenchmarkRun,
 } from "../../scripts/ad-hoc/omniroute-governor-benchmark-persistence.mjs";
 import { evaluatePairState } from "../../scripts/ad-hoc/omniroute-governor-pair-state.mjs";
+import { applyGovernorToAutoComboOrder } from "../../open-sse/governor/autoComboRuntime.ts";
+import { GovernorManager } from "../../open-sse/governor/governorManager.ts";
+import { classifyGovernorPlan } from "../../scripts/ad-hoc/omniroute-governor-pair-state.mjs";
 
 function target(executionKey: string, provider: string, model: string, connectionId: string) {
   return {
@@ -78,6 +81,8 @@ async function fixtureSnapshot() {
     candidate("anthropic-1", "anthropic", "claude-3-haiku", "conn-anthropic", {
       p95LatencyMs: 160,
       errorRate: 0.2,
+      circuitBreakerState: "OPEN",
+      statusPenalty: true,
     }),
   ];
   return makeNativeBaselineTestSnapshot({
@@ -101,10 +106,22 @@ async function fixtureSnapshot() {
     ]),
     breakers: {
       openai: { state: "CLOSED" },
-      anthropic: { state: "CLOSED" },
+      anthropic: { state: "OPEN" },
     },
-    cooldowns: [],
-    lockouts: [],
+    cooldowns: [
+      {
+        provider: "anthropic",
+        connectionId: "conn-anthropic",
+        rateLimitedUntil: "2099-01-01T00:00:00.000Z",
+      },
+    ],
+    lockouts: [
+      {
+        provider: "anthropic",
+        model: "claude-3-haiku",
+        connectionId: "conn-anthropic",
+      },
+    ],
   });
 }
 
@@ -137,19 +154,98 @@ test("Native baseline uses production Auto ordering without network or home-stat
   );
 });
 
+test("Native baseline preserves the complete routing request contract", () => {
+  const request = nativeBaselineRequest("contract-1", "fallback prompt", {
+    messages: [
+      { role: "system", content: "system contract" },
+      { role: "user", content: "user contract" },
+    ],
+    tools: [{ type: "function", function: { name: "lookup" } }],
+    response_format: { type: "json_object" },
+    temperature: 0.2,
+    max_tokens: 64,
+    task_context: { route: "structured" },
+    estimated_token_context: 48,
+    capability_requirements: ["tools", "structured_output"],
+  });
+
+  assert.deepEqual(request.body.messages, [
+    { role: "system", content: "system contract" },
+    { role: "user", content: "user contract" },
+  ]);
+  assert.equal(request.body.model, "auto/chat");
+  assert.deepEqual(request.body.tools, [{ type: "function", function: { name: "lookup" } }]);
+  assert.deepEqual(request.body.response_format, { type: "json_object" });
+  assert.equal(request.body.temperature, 0.2);
+  assert.equal(request.body.max_tokens, 64);
+  assert.deepEqual(request.body.task_context, { route: "structured" });
+  assert.equal(request.body.estimated_token_context, 48);
+  assert.deepEqual(request.body.capability_requirements, ["tools", "structured_output"]);
+});
+
 test("baseline snapshot preserves provider/model/connection and resilience sentinels", async () => {
   const snapshot = await fixtureSnapshot();
   assert.equal(snapshot.targets.length, 2);
   assert.equal(snapshot.candidates.length, 2);
   assert.ok(snapshot.capabilities["openai/gpt-4o-mini"]);
-  assert.deepEqual(snapshot.cooldowns, []);
-  assert.deepEqual(snapshot.lockouts, []);
+  assert.equal(snapshot.cooldowns[0].connectionId, "conn-anthropic");
+  assert.equal(snapshot.lockouts[0].model, "claude-3-haiku");
   assert.equal(snapshot.breakers.openai.state, "CLOSED");
+  assert.equal(snapshot.breakers.anthropic.state, "OPEN");
   assert.equal(snapshot.connections["conn-openai"].active, true);
   assert.equal(snapshot.routingConfig.combo.autoConfig.routerStrategy, "rules");
   assert.equal(snapshot.routingConfig.config.compatFilterFailOpen, false);
   assert.ok(snapshot.snapshotId.startsWith("native-baseline-"));
   assert.equal(snapshot.baselineSnapshotHash.length, 64);
+});
+
+test("baseline order keeps healthy candidates ahead of an exhausted unavailable tail", async () => {
+  const targets = [
+    target("healthy", "openai", "gpt-4o-mini", "conn-healthy"),
+    target("exhausted", "anthropic", "claude-3-haiku", "conn-exhausted"),
+  ];
+  const snapshot = await makeNativeBaselineTestSnapshot({
+    targets,
+    candidates: [
+      candidate("healthy", "openai", "gpt-4o-mini", "conn-healthy"),
+      candidate("exhausted", "anthropic", "claude-3-haiku", "conn-exhausted", {
+        quotaCutoffBlocked: true,
+        quotaRemaining: 0,
+        circuitBreakerState: "OPEN",
+        statusPenalty: true,
+      }),
+    ],
+    cooldowns: [{ provider: "anthropic", connectionId: "conn-exhausted" }],
+    lockouts: [{ provider: "anthropic", model: "claude-3-haiku" }],
+    breakers: { openai: { state: "CLOSED" }, anthropic: { state: "OPEN" } },
+  });
+  const result = resolveNativeBaselineWithoutExecution({
+    snapshot,
+    request: nativeBaselineRequest("filtering-1", "Reply with HEALTHY."),
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.nativeBaselineTarget, "healthy");
+  assert.equal(result.networkCalls, 0);
+  assert.equal(result.providerModelRequests, 0);
+
+  const exhaustedSnapshot = await makeNativeBaselineTestSnapshot({
+    targets,
+    candidates: [
+      candidate("exhausted", "anthropic", "claude-3-haiku", "conn-exhausted", {
+        quotaCutoffBlocked: true,
+        quotaRemaining: 0,
+      }),
+    ],
+  });
+  const exhausted = resolveNativeBaselineWithoutExecution({
+    snapshot: exhaustedSnapshot,
+    request: nativeBaselineRequest("filtering-2", "Reply with UNAVAILABLE."),
+  });
+  assert.equal(exhausted.valid, false);
+  assert.equal(exhausted.nativeBaselineTarget, null);
+  assert.equal(exhausted.networkCalls, 0);
+  assert.equal(exhausted.providerModelRequests, 0);
 });
 
 test("offline summary counts side-effect-free baselines and zero provider/model preflights", () => {
@@ -262,4 +358,86 @@ test("baseline drift and an unproven first actual are hard methodological failur
   });
   assert.equal(fallback.valid, true);
   assert.equal(fallback.failureClass, null);
+});
+
+test("offline readiness resolves ten baselines and executable Governor plans without models", async () => {
+  const oldEnv = { ...process.env };
+  try {
+    process.env.INTELLIGENCE_GOVERNOR_MODE = "simulate";
+    process.env.INTELLIGENCE_GOVERNOR_TELEMETRY = "false";
+    process.env.GOVERNOR_ACTIVE_ENABLED = "false";
+    process.env.GOVERNOR_ACTIVE_CANARY_RATE = "0";
+    GovernorManager.clearEvaluationCacheForTests();
+
+    const native = target("native", "opencode", "big-pickle", "native-connection");
+    const fallback = target("fallback", "felo-web", "felo-chat", "fallback-connection");
+    const nativeCandidate = candidate("native", "opencode", "big-pickle", "native-connection");
+    const fallbackCandidate = candidate("fallback", "felo-web", "felo-chat", "fallback-connection");
+    const snapshot = await makeNativeBaselineTestSnapshot({
+      targets: [native, fallback],
+      candidates: [nativeCandidate, fallbackCandidate],
+      metadata: [
+        { provider: "opencode", model: "big-pickle", capabilities: { tools: true } },
+        { provider: "felo-web", model: "felo-chat", capabilities: { tools: true } },
+      ],
+      connectionState: new Map([
+        ["native-connection", { provider: "opencode", active: true, testStatus: null }],
+        ["fallback-connection", { provider: "felo-web", active: true, testStatus: null }],
+      ]),
+    });
+
+    const baselines = [];
+    const plans = [];
+    for (let index = 0; index < 10; index += 1) {
+      const baseline = resolveNativeBaselineWithoutExecution({
+        snapshot,
+        request: nativeBaselineRequest(`readiness-${index + 1}`, "Reply with READY."),
+      });
+      baselines.push(baseline);
+      assert.equal(baseline.valid, true);
+      assert.equal(baseline.networkCalls, 0);
+      assert.equal(baseline.providerModelRequests, 0);
+
+      const nativeTarget = snapshot.targets.find(
+        (item) => item.executionKey === baseline.nativeBaselineTarget
+      );
+      assert.ok(nativeTarget);
+      const governor = await applyGovernorToAutoComboOrder({
+        body: {
+          model: "auto/chat",
+          messages: [{ role: "user", content: "Reply with READY." }],
+          max_tokens: 128,
+        },
+        promptText: "Reply with READY.",
+        estimatedInputTokens: 8,
+        taskType: "chat",
+        correlationId: `offline-readiness-${index + 1}`,
+        nativeSelectedTarget: nativeTarget,
+        orderedTargets: snapshot.targets,
+        routableCandidates: snapshot.candidates,
+      });
+      const plan = governor.context?.plan || null;
+      const planState = classifyGovernorPlan({
+        plan,
+        effectiveMode: "simulate",
+        revalidation: { valid: true },
+      });
+      plans.push(planState);
+    }
+
+    assert.equal(baselines.length, 10);
+    assert.equal(baselines.filter((item) => item.valid).length, 10);
+    assert.equal(plans.length, 10);
+    assert.equal(plans.filter((item) => item.executable).length, 10);
+    assert.equal(
+      baselines.every((item) => item.nativeBaselineTarget === "native"),
+      true
+    );
+  } finally {
+    GovernorManager.clearEvaluationCacheForTests();
+    for (const key of Object.keys(process.env)) {
+      if (!(key in oldEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, oldEnv);
+  }
 });
