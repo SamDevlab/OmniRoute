@@ -3,10 +3,7 @@ import fs from "node:fs";
 import test from "node:test";
 
 const harnessSource = fs.readFileSync(
-  new URL(
-    "../../scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs",
-    import.meta.url
-  ),
+  new URL("../../scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs", import.meta.url),
   "utf8"
 );
 
@@ -28,14 +25,8 @@ test(
     const source = fivePairGateSource();
 
     assert.match(source, /qualityMeasured/);
-    assert.match(
-      source,
-      /typeof pair\.native\?\.request\?\.qualityPass === "boolean"/
-    );
-    assert.match(
-      source,
-      /typeof pair\.governor\?\.direct\?\.qualityPass === "boolean"/
-    );
+    assert.match(source, /typeof pair\.native\?\.request\?\.qualityPass === "boolean"/);
+    assert.match(source, /typeof pair\.governor\?\.direct\?\.qualityPass === "boolean"/);
     assert.doesNotMatch(source, /&&\s*qualityPass\s*&&/);
     assert.doesNotMatch(source, /qualityPass\s*&&\s*artifactIntegrity/);
     assert.match(source, /qualityIsMethodologyGate:\s*false/);
@@ -60,48 +51,36 @@ test(
   }
 );
 
-test(
-  "authoritative gate still rejects structural, identity, and runtime failures",
-  () => {
-    const source = fivePairGateSource();
+test("authoritative gate still rejects structural, identity, and runtime failures", () => {
+  const source = fivePairGateSource();
 
-    for (const failure of [
-      "HARNESS_FAILURE",
-      "VALIDATOR_FAILURE",
-      "TARGET_MISMATCH",
-      "STALE_PLAN",
-      "SYSTEMIC_RUNTIME_FAILURE",
-    ]) {
-      assert.match(source, new RegExp(`\\"${failure}\\"`));
-    }
-    assert.match(source, /identityPass/);
-    assert.match(source, /correlationPass/);
-    assert.match(source, /artifactIntegrity/);
-    assert.match(source, /invalid === 0/);
+  for (const failure of [
+    "HARNESS_FAILURE",
+    "VALIDATOR_FAILURE",
+    "TARGET_MISMATCH",
+    "STALE_PLAN",
+    "SYSTEMIC_RUNTIME_FAILURE",
+  ]) {
+    assert.match(source, new RegExp(`\\"${failure}\\"`));
   }
-);
+  assert.match(source, /identityPass/);
+  assert.match(source, /correlationPass/);
+  assert.match(source, /artifactIntegrity/);
+  assert.match(source, /invalid === 0/);
+});
 
-test(
-  "authoritative conclusion refuses latency claims when no pair is latency-comparable",
-  () => {
-    const source = functionSource(
-      "authoritativeConclusion",
-      "calibrationRecoverySummary"
-    );
+test("authoritative conclusion refuses latency claims when no pair is latency-comparable", () => {
+  const source = functionSource("authoritativeConclusion", "calibrationRecoverySummary");
 
-    assert.match(source, /latencyComparablePairs/);
-    assert.match(source, /pair\.native\?\.request\?\.qualityPass === true/);
-    assert.match(source, /pair\.governor\?\.direct\?\.qualityPass === true/);
-    assert.match(source, /Number\.isFinite\(pair\.native\?\.e2eCompletionMs\)/);
-    assert.match(source, /Number\.isFinite\(pair\.governor\?\.e2eCompletionMs\)/);
-    assert.match(
-      source,
-      /latencyComparablePairs\.length === 0\) return "E2E_INCONCLUSIVE"/
-    );
-    assert.match(source, /pairwise\.nativeLatencyWins > pairwise\.governorLatencyWins/);
-    assert.match(source, /pairwise\.governorLatencyWins > pairwise\.nativeLatencyWins/);
-  }
-);
+  assert.match(source, /latencyComparablePairs/);
+  assert.match(source, /pair\.native\?\.request\?\.qualityPass === true/);
+  assert.match(source, /pair\.governor\?\.direct\?\.qualityPass === true/);
+  assert.match(source, /Number\.isFinite\(pair\.native\?\.e2eCompletionMs\)/);
+  assert.match(source, /Number\.isFinite\(pair\.governor\?\.e2eCompletionMs\)/);
+  assert.match(source, /latencyComparablePairs\.length === 0\) return "E2E_INCONCLUSIVE"/);
+  assert.match(source, /pairwise\.nativeLatencyWins > pairwise\.governorLatencyWins/);
+  assert.match(source, /pairwise\.governorLatencyWins > pairwise\.nativeLatencyWins/);
+});
 
 test(
   "Governor execution identity fails closed unless target and required connection are both proven",
@@ -114,10 +93,7 @@ test(
     assert.ok(start >= 0 && end > start);
     const source = harnessSource.slice(start, end);
 
-    assert.match(
-      source,
-      /targetMatch === "MISMATCH" \|\| connectionIdentity === "MISMATCH"/
-    );
+    assert.match(source, /targetMatch === "MISMATCH" \|\| connectionIdentity === "MISMATCH"/);
     assert.match(source, /targetMatch === "PASS" && connectionIdentity === "PASS"/);
     assert.match(source, /: "UNKNOWN"/);
   }
