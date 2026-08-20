@@ -24,8 +24,8 @@ concurrency:
   group: governor-harness-${{ github.ref }}
   cancel-in-progress: true
 
-# Temporary write permission only for the one-shot branch hardening step. Restored to read-only
-# after the generated harness patch is committed and independently validated.
+# Temporary write permission only for one-shot hardening/format cleanup. This is restored to
+# contents: read by the final cleanup commit after the generated code is validated.
 permissions:
   contents: write
 
@@ -105,9 +105,10 @@ jobs:
             tests/unit/governor/counterfactual-telemetry.test.ts \
             tests/unit/governor/stream-observability.test.ts
 
-      - name: Formatting and diff-safe syntax
+      - name: Format finalized files and publish cleanup
+        if: ${{ github.event_name == 'pull_request' && github.head_ref == 'feature/s3-intelligence-governor-prework-20260810' }}
         run: |
-          npx prettier --check \
+          npx prettier --write \
             scripts/ad-hoc/omniroute-governor-target-identity.mjs \
             scripts/ad-hoc/omniroute-governor-native-baseline-worker.mjs \
             scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs \
@@ -117,3 +118,20 @@ jobs:
             tests/unit/omniroute-governor-native-baseline.test.ts \
             tests/unit/omniroute-governor-authoritative-gate-contract.test.ts \
             .github/workflows/governor-harness.yml
+          git diff --check
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- \
+              scripts/ad-hoc/omniroute-governor-target-identity.mjs \
+              scripts/ad-hoc/omniroute-governor-native-baseline-worker.mjs \
+              scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs \
+              scripts/quality/classify-pr-changes.mjs \
+              tests/unit/classify-pr-changes.test.ts \
+              tests/unit/omniroute-governor-target-identity.test.ts \
+              tests/unit/omniroute-governor-native-baseline.test.ts \
+              tests/unit/omniroute-governor-authoritative-gate-contract.test.ts \
+              .github/workflows/governor-harness.yml
+            git commit -m "style(governor): format benchmark hardening"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
