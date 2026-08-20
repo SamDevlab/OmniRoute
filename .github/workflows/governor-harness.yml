@@ -24,10 +24,8 @@ concurrency:
   group: governor-harness-${{ github.ref }}
   cancel-in-progress: true
 
-# Temporary write permission only for one-shot hardening/format cleanup. This is restored to
-# contents: read by the final cleanup commit after the generated code is validated.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CI_NODE_VERSION: "24"
@@ -43,32 +41,22 @@ env:
 jobs:
   focused:
     name: Governor Harness Tests
+    # Intentionally no draft-PR guard. The tracking Governor PR remains draft during
+    # validation, and skipping these checks on drafts previously allowed harness
+    # regressions to reach model-facing benchmark runs.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.head_ref || github.ref_name }}
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Finalize authoritative harness invariants
-        if: ${{ github.event_name == 'pull_request' && github.head_ref == 'feature/s3-intelligence-governor-prework-20260810' }}
-        run: |
-          python scripts/ad-hoc/omniroute-governor-finalize-hardening.py
-          node --check scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs
-          git diff --check
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -- scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs
-            git commit -m "fix(test): finish authoritative benchmark hardening"
-            git push origin HEAD:${{ github.head_ref }}
-          fi
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
+
+      # Reuse the repository's transient-download retry policy. A bare npm ci caused
+      # the first focused run to false-red on an onnxruntime-node network timeout.
       - uses: ./.github/actions/npm-ci-retry
 
       - name: Diagnostic script syntax
@@ -105,12 +93,20 @@ jobs:
             tests/unit/governor/counterfactual-telemetry.test.ts \
             tests/unit/governor/stream-observability.test.ts
 
-      - name: Format finalized files and publish cleanup
-        if: ${{ github.event_name == 'pull_request' && github.head_ref == 'feature/s3-intelligence-governor-prework-20260810' }}
+      - name: Governor type safety
         run: |
-          npx prettier --write \
+          npm run typecheck:core
+          npm run check:open-sse-typecheck
+
+      - name: Formatting
+        run: |
+          npx prettier --check \
             scripts/ad-hoc/omniroute-governor-target-identity.mjs \
             scripts/ad-hoc/omniroute-governor-native-baseline-worker.mjs \
+            scripts/ad-hoc/omniroute-governor-native-baseline.mjs \
+            scripts/ad-hoc/omniroute-governor-pair-state.mjs \
+            scripts/ad-hoc/omniroute-governor-benchmark-persistence.mjs \
+            scripts/ad-hoc/omniroute-governor-run-summarizer.mjs \
             scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs \
             scripts/quality/classify-pr-changes.mjs \
             tests/unit/classify-pr-changes.test.ts \
@@ -118,20 +114,3 @@ jobs:
             tests/unit/omniroute-governor-native-baseline.test.ts \
             tests/unit/omniroute-governor-authoritative-gate-contract.test.ts \
             .github/workflows/governor-harness.yml
-          git diff --check
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -- \
-              scripts/ad-hoc/omniroute-governor-target-identity.mjs \
-              scripts/ad-hoc/omniroute-governor-native-baseline-worker.mjs \
-              scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs \
-              scripts/quality/classify-pr-changes.mjs \
-              tests/unit/classify-pr-changes.test.ts \
-              tests/unit/omniroute-governor-target-identity.test.ts \
-              tests/unit/omniroute-governor-native-baseline.test.ts \
-              tests/unit/omniroute-governor-authoritative-gate-contract.test.ts \
-              .github/workflows/governor-harness.yml
-            git commit -m "style(governor): format benchmark hardening"
-            git push origin HEAD:${{ github.head_ref }}
-          fi
