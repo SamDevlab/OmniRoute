@@ -1735,6 +1735,7 @@ async function handleSingleModelChat(
       if (!result.success && typeof result.rawMessage === "string") {
         attachInternalRawErrorMessage(result.response, result.rawMessage);
       }
+      const errorStr = String(result.rawMessage ?? result.error ?? "");
 
       const proxyLatency = Date.now() - proxyStartTime;
       const providerAlias = PROVIDER_ID_TO_ALIAS[provider] || provider;
@@ -2027,7 +2028,6 @@ async function handleSingleModelChat(
       // (truncated to its first line for the client response body) — Gemini's
       // TPM/RPD metric name and retry hint live on lines 2-3, after the
       // generic "quota exceeded" preamble on line 1.
-      const errorStr = String(result.rawMessage ?? result.error ?? "");
       const failureKind =
         result.status === 429
           ? isSubscriptionQuotaText(errorStr.toLowerCase(), provider)
