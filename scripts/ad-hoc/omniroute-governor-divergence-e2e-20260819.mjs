@@ -802,14 +802,26 @@ async function buildPool() {
 
 async function revalidateTarget(pool, provider, model) {
   const key = normalizeTarget(provider, model);
-  const target = pool.targets.find((item) => targetFromResolved(item).key === key);
-  const candidate = pool.candidates.find((item) => candidateKey(item) === key);
-  if (!target || !candidate) return { valid: false, reason: "target_not_in_current_pool" };
+  const targets = pool.targets.filter((item) => targetFromResolved(item).key === key);
+  const candidates = pool.candidates.filter((item) => candidateKey(item) === key);
+  if (targets.length === 0 || candidates.length === 0) {
+    return { valid: false, reason: "target_not_in_current_pool" };
+  }
+
   const breaker = getCircuitBreaker(provider).getStatus();
   const connectionIds = [
-    target.connectionId,
-    ...(Array.isArray(target.allowedConnectionIds) ? target.allowedConnectionIds : []),
+    ...new Set(
+      targets.flatMap((target) => [
+        target.connectionId,
+        ...(Array.isArray(target.allowedConnectionIds) ? target.allowedConnectionIds : []),
+      ])
+    ),
   ].filter((id) => typeof id === "string" && id !== "noauth");
+  const hasSyntheticNoauth = targets.some(
+    (target) =>
+      target.connectionId === "noauth" ||
+      (Array.isArray(target.allowedConnectionIds) && target.allowedConnectionIds.includes("noauth"))
+  );
   const connectionChecks = connectionIds.map((connectionId) => {
     const connection = pool.connectionState?.get(connectionId) || null;
     const rateLimitedUntil = connection?.rateLimitedUntil
@@ -819,54 +831,65 @@ async function revalidateTarget(pool, provider, model) {
     const unavailableStatus = ["unavailable", "banned", "expired", "credits_exhausted"].includes(
       connection?.testStatus
     );
+    const modelLocked = Boolean(getModelLockoutInfo(provider, connectionId, model));
     return {
       connectionId,
       connection,
       cooldownActive,
       unavailableStatus,
-      available: connection?.active === true && !cooldownActive && !unavailableStatus,
+      modelLocked,
+      available:
+        connection?.active === true && !cooldownActive && !unavailableStatus && !modelLocked,
     };
   });
-  const modelLockout = connectionIds.some((connectionId) =>
-    Boolean(getModelLockoutInfo(provider, connectionId, model))
-  );
+  const modelLockout =
+    connectionChecks.length > 0 && connectionChecks.every((check) => check.modelLocked);
   const connectionEligible =
-    connectionChecks.length === 0 || connectionChecks.some((check) => check.available);
+    hasSyntheticNoauth || connectionChecks.some((check) => check.available);
   const cooldownActive =
     connectionChecks.length > 0 && connectionChecks.every((check) => check.cooldownActive);
   const unavailableStatus =
     connectionChecks.length > 0 && connectionChecks.every((check) => check.unavailableStatus);
+  const candidateEligible = candidates.some((candidate) => candidate.quotaCutoffBlocked !== true);
+  const candidateHealthy = candidates.some(
+    (candidate) =>
+      candidate.circuitBreakerState !== "OPEN" && candidate.statusPenalty !== true
+  );
   const guardrails = {
     active: true,
-    eligible: candidate.quotaCutoffBlocked !== true,
-    healthy: breaker.state !== "OPEN" && candidate.statusPenalty !== true,
-    notCooldown: !cooldownActive,
-    notLocked: !modelLockout,
-    notExhausted: !unavailableStatus,
+    eligible: candidateEligible,
+    healthy: breaker.state !== "OPEN" && candidateHealthy,
+    notCooldown: hasSyntheticNoauth || !cooldownActive,
+    notLocked: hasSyntheticNoauth || !modelLockout,
+    notExhausted: hasSyntheticNoauth || !unavailableStatus,
     circuitAllowed: breaker.state !== "OPEN",
   };
   const valid = Object.values(guardrails).every(Boolean) && connectionEligible;
   return {
     valid,
     providerCircuitState: breaker.state,
+    targetCount: targets.length,
+    candidateCount: candidates.length,
     connectionState:
       connectionChecks.length > 0
         ? connectionChecks.map(
-            ({ connectionId, connection, cooldownActive, unavailableStatus }) => ({
+            ({ connectionId, connection, cooldownActive, unavailableStatus, modelLocked }) => ({
               connectionId,
               active: connection?.active === true,
               testStatus: connection?.testStatus || null,
               cooldownActive,
               unavailableStatus,
+              modelLocked,
             })
           )
-        : target.connectionId === "noauth"
+        : hasSyntheticNoauth
           ? "synthetic-noauth"
           : "unreported",
     cooldownActive,
     unavailableStatus,
     modelLockout,
     connectionEligible,
+    hasSyntheticNoauth,
     guardrails,
     reason: valid ? null : "stale_or_ineligible_target",
   };
@@ -1210,9 +1233,9 @@ async function runGovernorE2E(
   const targetIdentity =
     targetMatch === "MISMATCH" || connectionIdentity === "MISMATCH"
       ? "MISMATCH"
-      : targetMatch === "UNKNOWN"
-        ? "UNKNOWN"
-        : "PASS";
+      : targetMatch === "PASS" && connectionIdentity === "PASS"
+        ? "PASS"
+        : "UNKNOWN";
   const identityFailureClass =
     targetIdentity === "MISMATCH"
       ? "TARGET_MISMATCH"
@@ -2206,7 +2229,11 @@ function gateForFivePairs(pairs) {
         Boolean(pair.governor?.direct?.correlationId)
     );
   const identityPass =
-    pairs.length === 5 && pairs.every((pair) => pair.governor?.targetIdentity === "PASS");
+    pairs.length === 5 &&
+    pairs.every(
+      (pair) =>
+        pair.native?.targetIdentity === "PASS" && pair.governor?.targetIdentity === "PASS"
+    );
   // A real MODEL_QUALITY_FAILURE is a measured experimental outcome, not a methodology failure.
   // Require both validators to have produced boolean measurements, but do not require them true.
   const qualityMeasured =
@@ -2216,12 +2243,21 @@ function gateForFivePairs(pairs) {
         typeof pair.native?.request?.qualityPass === "boolean" &&
         typeof pair.governor?.direct?.qualityPass === "boolean"
     );
-  const artifactIntegrity = pairs.every(
-    (pair) =>
-      Boolean(pair.nativeOperationId || pair.native?.nativeOperationId) &&
-      Boolean(pair.governorPlanOperationId || pair.governor?.governorPlanOperationId) &&
-      Boolean(pair.governorOperationId || pair.governor?.governorOperationId)
-  );
+  const artifactIntegrity =
+    pairs.length === 5 &&
+    pairs.every(
+      (pair) =>
+        Boolean(pair.nativeOperationId || pair.native?.nativeOperationId) &&
+        Boolean(pair.governorPlanOperationId || pair.governor?.governorPlanOperationId) &&
+        Boolean(pair.governorOperationId || pair.governor?.governorOperationId) &&
+        Boolean(pair.pairCompleteOperationId)
+    );
+  const accountingPass =
+    pairs.length === 5 &&
+    accounting.nativeRequests === 5 &&
+    accounting.governorPlanningOperations === 5 &&
+    accounting.governorExecutionRequests === 5 &&
+    accounting.physicalRequests === 10;
   const forbiddenFailures = failureClasses.filter((failureClass) =>
     [
       "HARNESS_FAILURE",
@@ -2239,10 +2275,7 @@ function gateForFivePairs(pairs) {
     governor.executable === 5 &&
     governor.http === 5 &&
     governor.stream === 5 &&
-    accounting.nativeRequests === 5 &&
-    accounting.governorPlanningOperations === 5 &&
-    accounting.governorExecutionRequests === 5 &&
-    accounting.physicalRequests === 10 &&
+    accountingPass &&
     correlationPass &&
     identityPass &&
     qualityMeasured &&
@@ -2267,7 +2300,7 @@ function gateForFivePairs(pairs) {
     quality: qualityMeasured ? "MEASURED" : "UNMEASURED",
     qualityMeasured,
     qualityIsMethodologyGate: false,
-    accounting: pass ? "PASS" : "FAIL",
+    accounting: accountingPass ? "PASS" : "FAIL",
     identity: identityPass ? "PASS" : "FAIL",
     correlation: correlationPass ? "PASS" : "FAIL",
     artifactIntegrity: artifactIntegrity ? "PASS" : "FAIL",
@@ -2311,8 +2344,27 @@ function authoritativeConclusion(pairs, aggregates, pairwise) {
   const governorQuality = aggregates.governor.quality;
   if (governorQuality < nativeQuality) return "NATIVE_E2E_BETTER";
   if (nativeQuality < governorQuality) return "GOVERNOR_E2E_BETTER";
-  if (pairwise.nativeWins > pairwise.governorWins) return "NATIVE_E2E_BETTER";
-  if (pairwise.governorWins > pairwise.nativeWins) return "GOVERNOR_E2E_BETTER";
+
+  // Once aggregate quality is tied, latency may decide only on pairs where both arms
+  // passed quality/reliability and produced a complete total-E2E measurement.
+  const latencyComparablePairs = validPairs.filter(
+    (pair) =>
+      pair.native?.request?.qualityPass === true &&
+      pair.governor?.direct?.qualityPass === true &&
+      pair.native?.request?.status === 200 &&
+      pair.governor?.direct?.status === 200 &&
+      pair.native?.request?.streamCompleted === true &&
+      pair.governor?.direct?.streamCompleted === true &&
+      Number.isFinite(pair.native?.e2eCompletionMs) &&
+      Number.isFinite(pair.governor?.e2eCompletionMs)
+  );
+  if (latencyComparablePairs.length === 0) return "E2E_INCONCLUSIVE";
+  if (pairwise.nativeLatencyWins > pairwise.governorLatencyWins) {
+    return "NATIVE_E2E_BETTER";
+  }
+  if (pairwise.governorLatencyWins > pairwise.nativeLatencyWins) {
+    return "GOVERNOR_E2E_BETTER";
+  }
   return "E2E_ROUGHLY_EQUIVALENT";
 }
 
