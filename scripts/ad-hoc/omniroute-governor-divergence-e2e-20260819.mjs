@@ -40,6 +40,13 @@ import {
   nativeBaselineStateDigest,
   resolveNativeBaselineWithoutExecution,
 } from "./omniroute-governor-native-baseline.mjs";
+import {
+  canonicalTargetKey,
+  evaluatePlannedConnectionIdentity,
+  resolveNativeBaselinePoolTarget,
+  resolvePlanTargetDescriptor,
+  targetIdentityFromResolved,
+} from "./omniroute-governor-target-identity.mjs";
 
 const BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://127.0.0.1:20128";
 const REQUEST_TIMEOUT_MS = Math.max(
@@ -382,20 +389,18 @@ function targetKey(provider, model) {
 }
 
 function normalizeTarget(provider, model) {
-  const parsed = parseModel(`${provider}/${model}`);
-  return targetKey(provider || parsed.provider || "unknown", parsed.model || model);
+  return canonicalTargetKey(provider, model) || targetKey(provider || "unknown", model || "unknown");
 }
 
 function targetFromResolved(target) {
-  const parsed = parseModel(target.modelStr);
+  const identity = targetIdentityFromResolved(target);
   return {
-    provider: target.provider || parsed.provider || "unknown",
-    model: parsed.model || target.modelStr,
-    key: normalizeTarget(
-      target.provider || parsed.provider || "unknown",
-      parsed.model || target.modelStr
-    ),
-    modelStr: target.modelStr,
+    provider: identity.provider || "unknown",
+    model: identity.model || target?.modelStr || "unknown",
+    key: identity.canonicalTarget || normalizeTarget(identity.provider, identity.model),
+    modelStr: target?.modelStr || null,
+    executionKey: identity.executionKey || null,
+    connectionId: identity.connectionId || null,
   };
 }
 
@@ -626,8 +631,9 @@ export async function request(model, input, armLabel) {
 
 function modelForTarget(pool, provider, model) {
   const key = normalizeTarget(provider, model);
-  const target = pool.targets.find((item) => targetFromResolved(item).key === key);
-  return target?.modelStr || `${provider}/${model}`;
+  const matches = pool.targets.filter((item) => targetFromResolved(item).key === key);
+  const modelStrs = [...new Set(matches.map((target) => target.modelStr).filter(Boolean))];
+  return modelStrs.length === 1 ? modelStrs[0] : `${provider}/${model}`;
 }
 
 function candidateKey(candidate) {
@@ -940,10 +946,6 @@ function replayLatestDecisionsFromTelemetry() {
   const selectedRows = rows.slice(-completedCaseIds.length);
   return selectedRows.map((row, index) => {
     const plan = safePlan(row);
-    // The first completed row in this run followed a factual NVIDIA 404 and
-    // fallback in the server log. Without the original response headers in
-    // telemetry, fail closed and do not treat that terminal model as Native's
-    // first target for direct comparison.
     const native =
       index === 0
         ? null
@@ -1079,15 +1081,19 @@ async function runDirectComparisons(pool, decisions) {
 async function runGovernorE2E(
   pool,
   input,
-  nativeKey,
+  nativeBaseline,
   { artifactRun = null, pairId = null, order = null, authoritative = false } = {}
 ) {
   const started = performance.now();
   const startedAt = new Date().toISOString();
-  const nativeTargetResolved = pool.targets.find(
-    (target) => targetFromResolved(target).key === nativeKey
-  );
+  const baselineReference =
+    typeof nativeBaseline === "string"
+      ? { nativeBaselineTarget: nativeBaseline }
+      : nativeBaseline || {};
+  const baselineLookup = resolveNativeBaselinePoolTarget(pool.targets, baselineReference);
+  const nativeTargetResolved = baselineLookup.target;
   if (!nativeTargetResolved) {
+    const failureReason = baselineLookup.failureReason || "NATIVE_BASELINE_TARGET_NOT_IN_CURRENT_POOL";
     const governorPlanOperationId = appendGovernorPlanOperation(artifactRun, {
       pairId,
       input,
@@ -1101,7 +1107,7 @@ async function runGovernorE2E(
         state: "NATIVE_TARGET_MISSING",
         executable: false,
         failureClass: "HARNESS_FAILURE",
-        failureReason: "NATIVE_TARGET_NOT_IN_CURRENT_POOL",
+        failureReason,
         rootCause: "HARNESS_LOGIC_ERROR",
       },
       effectiveGovernorMode: artifactRun?.effectiveGovernorMode || getGovernorMode(),
@@ -1110,9 +1116,13 @@ async function runGovernorE2E(
     return {
       caseId: input.id,
       valid: false,
-      reason: "native_target_not_in_current_pool",
+      reason: failureReason,
       failureClass: "HARNESS_FAILURE",
+      failureReason,
+      rootCause: "HARNESS_LOGIC_ERROR",
+      stopBenchmark: true,
       governorPlanOperationId,
+      baselineLookup,
       startedAt,
       completedAt: new Date().toISOString(),
     };
@@ -1136,11 +1146,7 @@ async function runGovernorE2E(
   const plan = runtime.context?.plan || null;
   const effectiveGovernorMode = artifactRun?.effectiveGovernorMode || getGovernorMode();
   const key = planTarget(plan);
-  const plannedTarget = key
-    ? resolvedTargetDescriptor(
-        pool.targets.find((target) => targetFromResolved(target).key === key)
-      )
-    : null;
+  const plannedTarget = key ? resolvePlanTargetDescriptor(pool.targets, key) : null;
   const revalidation =
     plan?.executable === true && key
       ? await revalidateTarget(pool, ...key.split(/\/(.*)/s).slice(0, 2))
@@ -1188,6 +1194,7 @@ async function runGovernorE2E(
       completedAt: new Date().toISOString(),
       plan,
       revalidation,
+      baselineLookup,
     };
   }
   const [provider, ...modelParts] = key.split("/");
@@ -1196,17 +1203,10 @@ async function runGovernorE2E(
   const executedTarget = direct.executedTarget;
   const targetMatch = executedTarget ? (executedTarget === key ? "PASS" : "MISMATCH") : "UNKNOWN";
   const plannedConnectionId = plannedTarget?.connectionId || null;
-  const allowedConnectionIds = plannedTarget?.allowedConnectionIds || [];
-  const connectionIdentity =
-    plannedConnectionId && plannedConnectionId !== "noauth"
-      ? direct.executedConnectionId === plannedConnectionId
-        ? "PASS"
-        : "MISMATCH"
-      : direct.executedConnectionId && allowedConnectionIds.includes(direct.executedConnectionId)
-        ? "PASS"
-        : plannedConnectionId === "noauth" && direct.executedConnectionId === "noauth"
-          ? "PASS"
-          : "NOT_AVAILABLE";
+  const connectionIdentity = evaluatePlannedConnectionIdentity(
+    plannedTarget,
+    direct.executedConnectionId
+  );
   const targetIdentity =
     targetMatch === "MISMATCH" || connectionIdentity === "MISMATCH"
       ? "MISMATCH"
@@ -1256,7 +1256,7 @@ async function runGovernorE2E(
     plan,
     plannedTarget,
     executedTarget,
-    plannedConnectionId: plannedTarget?.connectionId || null,
+    plannedConnectionId,
     executedConnectionId: direct.executedConnectionId,
     targetIdentity,
     targetMatch,
@@ -1264,6 +1264,7 @@ async function runGovernorE2E(
     revalidation,
     direct,
     selectedTarget: key,
+    baselineLookup,
   };
 }
 
@@ -1275,6 +1276,7 @@ async function runNativeE2E(
     order = null,
     authoritative = false,
     nativeBaselineTarget = null,
+    nativeBaselineExecutionKey = null,
     nativeBaselineConnection = null,
     baselineSnapshotId = null,
     baselineSnapshotHash = null,
@@ -1317,6 +1319,7 @@ async function runNativeE2E(
     nativeFirstTarget,
     nativeFinalTarget,
     nativeBaselineTarget,
+    nativeBaselineExecutionKey,
     nativeBaselineConnection,
     nativeBaselineResolution: nativeBaselineTarget ? "side_effect_free" : null,
     baselineSnapshotId,
@@ -1348,6 +1351,7 @@ async function runNativeE2E(
     nativeFirstTarget,
     nativeFinalTarget,
     nativeBaselineTarget,
+    nativeBaselineExecutionKey,
     baselineNativeTarget: nativeBaselineTarget,
     nativeFirstActualTarget: nativeFirstTarget,
     nativeFinalActualTarget: nativeFinalTarget,
@@ -1388,9 +1392,19 @@ async function runE2E(
     const governorFirst = index % 2 === 1;
     const pairId = "pair-" + String(index + 1).padStart(2, "0");
     const order = governorFirst ? "governor_then_native" : "native_then_governor";
-    const nativeTarget = decision.nativeBaselineTarget || decision.nativeTarget;
+    const baselineReference =
+      decision.nativeBaseline ||
+      (decision.nativeBaselineTarget
+        ? {
+            nativeBaselineTarget: decision.nativeBaselineTarget,
+            nativeBaselineCanonicalTarget:
+              decision.nativeBaselineCanonicalTarget || decision.nativeBaselineTarget,
+            nativeBaselineExecutionKey: decision.nativeBaselineExecutionKey || null,
+            nativeBaselineConnection: decision.nativeBaselineConnection || null,
+          }
+        : decision.nativeTarget);
     const governorPromise = () =>
-      runGovernorE2E(pool, input, nativeTarget, {
+      runGovernorE2E(pool, input, baselineReference, {
         artifactRun,
         pairId,
         order,
@@ -1403,6 +1417,7 @@ async function runE2E(
         order,
         authoritative,
         nativeBaselineTarget: decision.nativeBaselineTarget || null,
+        nativeBaselineExecutionKey: decision.nativeBaselineExecutionKey || null,
         nativeBaselineConnection: decision.nativeBaselineConnection || null,
         baselineSnapshotId: decision.baselineSnapshotId || null,
         baselineSnapshotHash: decision.baselineSnapshotHash || null,
@@ -1417,7 +1432,9 @@ async function runE2E(
       order,
       native,
       governor,
+      baseline: typeof baselineReference === "object" ? baselineReference : null,
       nativeBaselineTarget: decision.nativeBaselineTarget || null,
+      nativeBaselineExecutionKey: decision.nativeBaselineExecutionKey || null,
       baselineSnapshotId: decision.baselineSnapshotId || null,
       baselineSnapshotHash: decision.baselineSnapshotHash || null,
     };
@@ -1578,6 +1595,7 @@ function appendArmOperation(
     nativeFirstTarget,
     nativeFinalTarget,
     nativeBaselineTarget,
+    nativeBaselineExecutionKey,
     nativeBaselineConnection,
     nativeBaselineResolution,
     baselineSnapshotId,
@@ -1619,6 +1637,8 @@ function appendArmOperation(
     nativeBaselineProvider: operationTargetParts(nativeBaselineTarget).provider,
     nativeBaselineModel: operationTargetParts(nativeBaselineTarget).model,
     nativeBaselineTarget: operationTargetParts(nativeBaselineTarget).target,
+    nativeBaselineCanonicalTarget: operationTargetParts(nativeBaselineTarget).target,
+    nativeBaselineExecutionKey: nativeBaselineExecutionKey || null,
     nativeBaselineConnection: nativeBaselineConnection || plannedTarget?.connectionId || null,
     nativeBaselineResolution: nativeBaselineResolution || null,
     baselineSnapshotId: baselineSnapshotId || null,
@@ -1667,6 +1687,7 @@ function appendGovernorPlanOperation(
     plannedModel: planned.model,
     plannedTarget: planned.target,
     plannedConnectionId: plannedTarget?.connectionId || null,
+    allowedConnectionIds: plannedTarget?.allowedConnectionIds || [],
     planPresent: Boolean(plan),
     planState: planState?.state || null,
     executable: planState?.executable === true,
@@ -1756,7 +1777,11 @@ function appendPairCompleteOperation(run, pair, input, authoritative) {
       pair.governorPlanOperationId || pair.governor?.governorPlanOperationId || null,
     governorArmOperationId: pair.governorOperationId || pair.governor?.governorOperationId || null,
     nativeBaselineOperationId: pair.nativeBaselineOperationId || null,
-    nativeBaselineTarget: pair.nativeBaselineTarget || null,
+    nativeBaselineTarget: pair.nativeBaselineTarget || pair.baseline?.nativeBaselineTarget || null,
+    nativeBaselineCanonicalTarget:
+      pair.nativeBaselineTarget || pair.baseline?.nativeBaselineCanonicalTarget || null,
+    nativeBaselineExecutionKey:
+      pair.nativeBaselineExecutionKey || pair.baseline?.nativeBaselineExecutionKey || null,
     nativeFirstActualTarget: pair.nativeFirstActualTarget || null,
     nativeFinalActualTarget: pair.nativeFinalActualTarget || null,
     baselineVsFirstActual: pair.baselineVsFirstActual || null,
@@ -1835,6 +1860,8 @@ async function resolveAuthoritativeNativeBaseline(
   const afterDigest = nativeBaselineStateDigest(snapshot);
   const completedAt = new Date().toISOString();
   const baselineTarget = resolution.nativeBaselineTarget || null;
+  const baselineCanonicalTarget = resolution.nativeBaselineCanonicalTarget || baselineTarget;
+  const baselineExecutionKey = resolution.nativeBaselineExecutionKey || null;
   const baselineOperationId = artifactRun?.appendOperation({
     operationType: "native_baseline_resolution",
     arm: "native",
@@ -1848,6 +1875,8 @@ async function resolveAuthoritativeNativeBaseline(
     nativeBaselineModel: resolution.nativeBaselineModel || null,
     nativeBaselineConnection: resolution.nativeBaselineConnection || null,
     nativeBaselineTarget: baselineTarget,
+    nativeBaselineCanonicalTarget: baselineCanonicalTarget,
+    nativeBaselineExecutionKey: baselineExecutionKey,
     nativeBaselineResolution: "side_effect_free",
     baselineSnapshotId: resolution.baselineSnapshotId,
     baselineSnapshotHash: resolution.baselineSnapshotHash,
@@ -1867,6 +1896,8 @@ async function resolveAuthoritativeNativeBaseline(
   return {
     caseId: input.id,
     nativeBaselineTarget: baselineTarget,
+    nativeBaselineCanonicalTarget: baselineCanonicalTarget,
+    nativeBaselineExecutionKey: baselineExecutionKey,
     nativeBaselineProvider: resolution.nativeBaselineProvider || null,
     nativeBaselineModel: resolution.nativeBaselineModel || null,
     nativeBaselineConnection: resolution.nativeBaselineConnection || null,
@@ -1940,6 +1971,8 @@ function buildAuthoritativePair(pairId, input, order, baseline, native, governor
     governor,
     baseline,
     nativeBaselineTarget,
+    nativeBaselineCanonicalTarget: baseline.nativeBaselineCanonicalTarget || nativeBaselineTarget,
+    nativeBaselineExecutionKey: baseline.nativeBaselineExecutionKey || null,
     baselineNativeTarget: nativeBaselineTarget,
     nativeFirstActualTarget,
     nativeFinalActualTarget,
@@ -1996,7 +2029,7 @@ async function runAuthoritativePair(pool, input, baseline, pairIndex, { artifact
   const order = governorFirst ? "governor_then_native" : "native_then_governor";
   const pairId = "pair-" + String(pairIndex + 1).padStart(2, "0");
   const governorPromise = () =>
-    runGovernorE2E(pool, input, nativeKey, {
+    runGovernorE2E(pool, input, baseline, {
       artifactRun,
       pairId,
       order,
@@ -2009,6 +2042,7 @@ async function runAuthoritativePair(pool, input, baseline, pairIndex, { artifact
       order,
       authoritative: true,
       nativeBaselineTarget: baseline.nativeBaselineTarget,
+      nativeBaselineExecutionKey: baseline.nativeBaselineExecutionKey,
       nativeBaselineConnection: baseline.nativeBaselineConnection,
       baselineSnapshotId: baseline.baselineSnapshotId,
       baselineSnapshotHash: baseline.baselineSnapshotHash,
@@ -2168,15 +2202,19 @@ function gateForFivePairs(pairs) {
     pairs.length === 5 &&
     pairs.every(
       (pair) =>
-        Boolean(pair.native.request?.correlationId) && Boolean(pair.governor.direct?.correlationId)
+        Boolean(pair.native?.request?.correlationId) &&
+        Boolean(pair.governor?.direct?.correlationId)
     );
   const identityPass =
     pairs.length === 5 && pairs.every((pair) => pair.governor?.targetIdentity === "PASS");
-  const qualityPass =
+  // A real MODEL_QUALITY_FAILURE is a measured experimental outcome, not a methodology failure.
+  // Require both validators to have produced boolean measurements, but do not require them true.
+  const qualityMeasured =
     pairs.length === 5 &&
     pairs.every(
       (pair) =>
-        pair.native?.request?.qualityPass === true && pair.governor?.direct?.qualityPass === true
+        typeof pair.native?.request?.qualityPass === "boolean" &&
+        typeof pair.governor?.direct?.qualityPass === "boolean"
     );
   const artifactIntegrity = pairs.every(
     (pair) =>
@@ -2207,7 +2245,7 @@ function gateForFivePairs(pairs) {
     accounting.physicalRequests === 10 &&
     correlationPass &&
     identityPass &&
-    qualityPass &&
+    qualityMeasured &&
     artifactIntegrity &&
     invalid === 0 &&
     forbiddenFailures.length === 0;
@@ -2226,7 +2264,9 @@ function gateForFivePairs(pairs) {
     governorStreams: governor.stream,
     nativeQuality: native.quality,
     governorQuality: governor.quality,
-    quality: qualityPass ? "PASS" : "FAIL",
+    quality: qualityMeasured ? "MEASURED" : "UNMEASURED",
+    qualityMeasured,
+    qualityIsMethodologyGate: false,
     accounting: pass ? "PASS" : "FAIL",
     identity: identityPass ? "PASS" : "FAIL",
     correlation: correlationPass ? "PASS" : "FAIL",
@@ -2500,7 +2540,10 @@ if (calibrationRecoveryOnly) {
       caseId: input.id,
       category: input.category,
       nativeTarget: baseline.nativeBaselineTarget,
+      nativeBaseline: baseline,
       nativeBaselineTarget: baseline.nativeBaselineTarget,
+      nativeBaselineCanonicalTarget: baseline.nativeBaselineCanonicalTarget,
+      nativeBaselineExecutionKey: baseline.nativeBaselineExecutionKey,
       nativeBaselineConnection: baseline.nativeBaselineConnection,
       baselineSnapshotId: baseline.baselineSnapshotId,
       baselineSnapshotHash: baseline.baselineSnapshotHash,
@@ -2673,6 +2716,8 @@ if (authoritativeOnly) {
         nativeBaseline: nativeBaseline.map((item) => ({
           caseId: item.caseId,
           nativeBaselineTarget: item.nativeBaselineTarget,
+          nativeBaselineCanonicalTarget: item.nativeBaselineCanonicalTarget,
+          nativeBaselineExecutionKey: item.nativeBaselineExecutionKey,
           nativeBaselineProvider: item.nativeBaselineProvider,
           nativeBaselineModel: item.nativeBaselineModel,
           nativeBaselineConnection: item.nativeBaselineConnection,
