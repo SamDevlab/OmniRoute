@@ -144,7 +144,9 @@ test("Native baseline uses production Auto ordering without network or home-stat
   assert.equal(before, after);
   assert.equal(result.baselineSnapshotId, snapshot.snapshotId);
   assert.equal(result.baselineSnapshotHash, snapshot.baselineSnapshotHash);
-  assert.equal(result.nativeBaselineTarget, "openai-1");
+  assert.equal(result.nativeBaselineTarget, "openai/gpt-4o-mini");
+  assert.equal(result.nativeBaselineCanonicalTarget, "openai/gpt-4o-mini");
+  assert.equal(result.nativeBaselineExecutionKey, "openai-1");
   assert.equal(result.nativeBaselineProvider, "openai");
   assert.equal(result.nativeBaselineModel, "gpt-4o-mini");
   assert.equal(result.nativeBaselineConnection, "conn-openai");
@@ -152,6 +154,40 @@ test("Native baseline uses production Auto ordering without network or home-stat
     result.nativeBaselineCandidateOrder.map((entry) => entry.executionKey),
     ["openai-1", "anthropic-1"]
   );
+  assert.deepEqual(
+    result.nativeBaselineCandidateOrder.map((entry) => entry.canonicalTarget),
+    ["openai/gpt-4o-mini", "anthropic/claude-3-haiku"]
+  );
+});
+
+test("virtual OpenCode execution keys normalize to canonical provider/model without losing audit identity", async () => {
+  const virtual = {
+    ...target("virtual-auto-default-1-opencode", "opencode", "big-pickle", "noauth"),
+    modelStr: "oc/big-pickle",
+  };
+  const snapshot = await makeNativeBaselineTestSnapshot({
+    targets: [virtual],
+    candidates: [
+      candidate("virtual-auto-default-1-opencode", "opencode", "big-pickle", "noauth", {
+        modelStr: "oc/big-pickle",
+      }),
+    ],
+  });
+
+  const result = resolveNativeBaselineWithoutExecution({
+    snapshot,
+    request: nativeBaselineRequest("opencode-virtual", "Reply with exactly OK."),
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.nativeBaselineExecutionKey, "virtual-auto-default-1-opencode");
+  assert.equal(result.nativeBaselineProvider, "opencode");
+  assert.equal(result.nativeBaselineModel, "big-pickle");
+  assert.equal(result.nativeBaselineCanonicalTarget, "opencode/big-pickle");
+  assert.equal(result.nativeBaselineTarget, "opencode/big-pickle");
+  assert.equal(result.nativeBaselineConnection, "noauth");
+  assert.equal(result.nativeBaselineCandidateOrder[0].executionKey, "virtual-auto-default-1-opencode");
+  assert.equal(result.nativeBaselineCandidateOrder[0].canonicalTarget, "opencode/big-pickle");
 });
 
 test("Native baseline preserves the complete routing request contract", () => {
@@ -225,7 +261,8 @@ test("baseline order keeps healthy candidates ahead of an exhausted unavailable 
   });
 
   assert.equal(result.valid, true);
-  assert.equal(result.nativeBaselineTarget, "healthy");
+  assert.equal(result.nativeBaselineTarget, "openai/gpt-4o-mini");
+  assert.equal(result.nativeBaselineExecutionKey, "healthy");
   assert.equal(result.networkCalls, 0);
   assert.equal(result.providerModelRequests, 0);
 
@@ -244,6 +281,7 @@ test("baseline order keeps healthy candidates ahead of an exhausted unavailable 
   });
   assert.equal(exhausted.valid, false);
   assert.equal(exhausted.nativeBaselineTarget, null);
+  assert.equal(exhausted.nativeBaselineExecutionKey, null);
   assert.equal(exhausted.networkCalls, 0);
   assert.equal(exhausted.providerModelRequests, 0);
 });
@@ -263,7 +301,8 @@ test("offline summary counts side-effect-free baselines and zero provider/model 
     run.appendOperation({
       operationType: "native_baseline_resolution",
       caseId: "fixture-1",
-      nativeBaselineTarget: "openai-1",
+      nativeBaselineTarget: "openai/gpt-4o-mini",
+      nativeBaselineExecutionKey: "openai-1",
       nativeBaselineResolution: "side_effect_free",
       providerModelRequests: 0,
       governorProviderModelPreflightRequests: 0,
@@ -358,6 +397,21 @@ test("baseline drift and an unproven first actual are hard methodological failur
   });
   assert.equal(fallback.valid, true);
   assert.equal(fallback.failureClass, null);
+
+  const canonicalMatch = evaluatePairState({
+    native: {
+      ...native,
+      nativeFirstActualTarget: "opencode/big-pickle",
+      nativeFinalActualTarget: "opencode/big-pickle",
+    },
+    governor,
+    baseline: {
+      nativeBaselineTarget: "opencode/big-pickle",
+      nativeBaselineExecutionKey: "virtual-auto-default-1-opencode",
+    },
+  });
+  assert.equal(canonicalMatch.valid, true);
+  assert.equal(canonicalMatch.failureClass, null);
 });
 
 test("offline readiness resolves ten baselines and executable Governor plans without models", async () => {
@@ -399,7 +453,7 @@ test("offline readiness resolves ten baselines and executable Governor plans wit
       assert.equal(baseline.providerModelRequests, 0);
 
       const nativeTarget = snapshot.targets.find(
-        (item) => item.executionKey === baseline.nativeBaselineTarget
+        (item) => item.executionKey === baseline.nativeBaselineExecutionKey
       );
       assert.ok(nativeTarget);
       const governor = await applyGovernorToAutoComboOrder({
@@ -430,7 +484,11 @@ test("offline readiness resolves ten baselines and executable Governor plans wit
     assert.equal(plans.length, 10);
     assert.equal(plans.filter((item) => item.executable).length, 10);
     assert.equal(
-      baselines.every((item) => item.nativeBaselineTarget === "native"),
+      baselines.every((item) => item.nativeBaselineTarget === "opencode/big-pickle"),
+      true
+    );
+    assert.equal(
+      baselines.every((item) => item.nativeBaselineExecutionKey === "native"),
       true
     );
   } finally {
