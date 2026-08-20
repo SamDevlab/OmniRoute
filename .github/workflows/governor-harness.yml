@@ -1,6 +1,12 @@
 name: Governor Harness
 
 on:
+  push:
+    branches:
+      - feature/s3-intelligence-governor-prework-20260810
+    paths:
+      - "src/sse/handlers/chat.ts"
+      - ".github/workflows/governor-harness.yml"
   pull_request:
     branches: ["release/**"]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -53,7 +59,7 @@ jobs:
           persist-credentials: true
 
       - name: Fix raw error classification declaration order
-        if: ${{ github.event_name == 'pull_request' && github.head_ref == 'feature/s3-intelligence-governor-prework-20260810' }}
+        if: ${{ (github.event_name == 'pull_request' && github.head_ref == 'feature/s3-intelligence-governor-prework-20260810') || (github.event_name == 'push' && github.ref_name == 'feature/s3-intelligence-governor-prework-20260810') }}
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -82,7 +88,7 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -- src/sse/handlers/chat.ts
             git commit -m "fix(chat): define raw error text before account fallback"
-            git push origin HEAD:${{ github.head_ref }}
+            git push origin HEAD:feature/s3-intelligence-governor-prework-20260810
           fi
 
       - uses: actions/setup-node@v7
