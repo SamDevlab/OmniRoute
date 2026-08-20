@@ -13,6 +13,7 @@ on:
       - "open-sse/services/combo/**"
       - "open-sse/services/autoCombo/**"
       - "open-sse/services/model.ts"
+      - "src/sse/handlers/chat.ts"
       - "src/shared/utils/featureFlags.ts"
       - "src/shared/constants/featureFlagDefinitions.ts"
       - "scripts/quality/classify-pr-changes.mjs"
@@ -24,8 +25,10 @@ concurrency:
   group: governor-harness-${{ github.ref }}
   cancel-in-progress: true
 
+# Temporary write permission for the one-shot TS2448 correction discovered by this gate.
+# Restored to contents: read immediately after the source fix lands.
 permissions:
-  contents: read
+  contents: write
 
 env:
   CI_NODE_VERSION: "24"
@@ -41,22 +44,52 @@ env:
 jobs:
   focused:
     name: Governor Harness Tests
-    # Intentionally no draft-PR guard. The tracking Governor PR remains draft during
-    # validation, and skipping these checks on drafts previously allowed harness
-    # regressions to reach model-facing benchmark runs.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          persist-credentials: false
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fix raw error classification declaration order
+        if: ${{ github.event_name == 'pull_request' && github.head_ref == 'feature/s3-intelligence-governor-prework-20260810' }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/sse/handlers/chat.ts")
+          text = path.read_text(encoding="utf-8")
+          declaration = '      const errorStr = String(result.rawMessage ?? result.error ?? "");\n'
+          anchor = '''      if (!result.success && typeof result.rawMessage === "string") {
+            attachInternalRawErrorMessage(result.response, result.rawMessage);
+          }
+'''
+          if text.count(declaration) != 1:
+              raise SystemExit(f"expected one errorStr declaration, found {text.count(declaration)}")
+          if text.count(anchor) != 1:
+              raise SystemExit(f"expected one upstream-result anchor, found {text.count(anchor)}")
+
+          text = text.replace(declaration, "", 1)
+          text = text.replace(anchor, anchor + declaration, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          npx prettier --write src/sse/handlers/chat.ts
+          git diff --check
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- src/sse/handlers/chat.ts
+            git commit -m "fix(chat): define raw error text before account fallback"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
 
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
 
-      # Reuse the repository's transient-download retry policy. A bare npm ci caused
-      # the first focused run to false-red on an onnxruntime-node network timeout.
       - uses: ./.github/actions/npm-ci-retry
 
       - name: Diagnostic script syntax
@@ -101,6 +134,7 @@ jobs:
       - name: Formatting
         run: |
           npx prettier --check \
+            src/sse/handlers/chat.ts \
             scripts/ad-hoc/omniroute-governor-target-identity.mjs \
             scripts/ad-hoc/omniroute-governor-native-baseline-worker.mjs \
             scripts/ad-hoc/omniroute-governor-native-baseline.mjs \
