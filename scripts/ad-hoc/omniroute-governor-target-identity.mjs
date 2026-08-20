@@ -1,15 +1,30 @@
+import { PROVIDER_ID_TO_ALIAS } from "../../open-sse/config/providerModels.ts";
 import { parseModel } from "../../open-sse/services/model.ts";
 
 function cleanString(value) {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+/**
+ * Produce the benchmark's canonical routing identity while keeping the explicit provider
+ * authoritative. Some providers expose a public model dialect that itself contains a provider
+ * alias (for example OpenCode `oc/big-pickle`), while other providers legitimately expose model
+ * IDs containing `/` (for example NVIDIA serving `openai/gpt-oss-*`). Only strip an inner prefix
+ * when parsing that raw model resolves back to the same explicit provider.
+ */
 export function canonicalTargetKey(provider, model) {
   const explicitProvider = cleanString(provider);
   const rawModel = cleanString(model);
   if (!explicitProvider || !rawModel) return null;
-  const parsed = parseModel(`${explicitProvider}/${rawModel}`);
-  return `${explicitProvider}/${parsed.model || rawModel}`;
+
+  const rawParsed = parseModel(rawModel);
+  if (rawParsed.provider === explicitProvider && rawParsed.model) {
+    return `${explicitProvider}/${rawParsed.model}`;
+  }
+
+  const providerPrefix = PROVIDER_ID_TO_ALIAS[explicitProvider] || explicitProvider;
+  const pairParsed = parseModel(`${providerPrefix}/${rawModel}`);
+  return `${explicitProvider}/${pairParsed.model || rawModel}`;
 }
 
 export function targetIdentityFromResolved(target) {
@@ -25,7 +40,7 @@ export function targetIdentityFromResolved(target) {
     };
   }
   const modelStr = cleanString(target.modelStr);
-  const parsed = parseModel(modelStr);
+  const parsed = modelStr ? parseModel(modelStr) : { provider: null, model: null };
   const provider = cleanString(target.provider) || cleanString(parsed.provider) || "unknown";
   const model = cleanString(parsed.model) || modelStr;
   const canonicalTarget = model ? canonicalTargetKey(provider, model) : null;
@@ -66,10 +81,7 @@ export function targetIdentityFromObserved(provider, model, connectionId = null)
 function connectionCompatible(identity, requestedConnection) {
   const connection = cleanString(requestedConnection);
   if (!connection) return true;
-  return (
-    identity.connectionId === connection ||
-    identity.allowedConnectionIds.includes(connection)
-  );
+  return identity.connectionId === connection || identity.allowedConnectionIds.includes(connection);
 }
 
 export function resolveNativeBaselinePoolTarget(targets, baseline) {
@@ -160,9 +172,7 @@ export function resolvePlanTargetDescriptor(targets, canonicalTarget) {
     .filter(({ identity }) => identity.canonicalTarget === key);
   if (matches.length === 0) return null;
 
-  const connections = [
-    ...new Set(matches.flatMap(({ identity }) => identity.allowedConnectionIds)),
-  ];
+  const connections = [...new Set(matches.flatMap(({ identity }) => identity.allowedConnectionIds))];
   const directConnections = [
     ...new Set(matches.map(({ identity }) => identity.connectionId).filter(Boolean)),
   ];
@@ -183,10 +193,17 @@ export function evaluatePlannedConnectionIdentity(plannedTarget, executedConnect
   if (!plannedTarget) return "UNKNOWN";
   const explicit = cleanString(plannedTarget.connectionId);
   const allowed = Array.isArray(plannedTarget.allowedConnectionIds)
-    ? plannedTarget.allowedConnectionIds.filter((value) => cleanString(value))
+    ? plannedTarget.allowedConnectionIds.map(cleanString).filter(Boolean)
     : [];
 
-  if (!executed) return "NOT_AVAILABLE";
+  // Synthetic no-auth targets have no credential identity to prove. A missing call-log
+  // connection is therefore acceptable only for this explicit noauth case.
+  if (explicit === "noauth") {
+    return !executed || executed === "noauth" ? "PASS" : "MISMATCH";
+  }
+  if (!executed) {
+    return explicit || allowed.length > 0 ? "UNKNOWN" : "NOT_AVAILABLE";
+  }
   if (explicit) return executed === explicit ? "PASS" : "MISMATCH";
   if (allowed.length > 0) return allowed.includes(executed) ? "PASS" : "MISMATCH";
   return "NOT_AVAILABLE";
