@@ -117,11 +117,20 @@ jobs:
           npm run typecheck:core
           npm run check:open-sse-typecheck
 
-      - name: Formatting diagnostic
+      - name: Formatting
         run: |
-          cp tests/unit/omniroute-governor-authoritative-gate-contract.test.ts /tmp/gate-before.ts
-          npx prettier --write tests/unit/omniroute-governor-authoritative-gate-contract.test.ts
-          echo "----- PRETTIER EXACT DIFF -----"
-          git diff -- tests/unit/omniroute-governor-authoritative-gate-contract.test.ts
-          echo "----- END PRETTIER EXACT DIFF -----"
-          cmp -s /tmp/gate-before.ts tests/unit/omniroute-governor-authoritative-gate-contract.test.ts
+          npx prettier --check \
+            src/sse/handlers/chat.ts \
+            scripts/ad-hoc/omniroute-governor-target-identity.mjs \
+            scripts/ad-hoc/omniroute-governor-native-baseline-worker.mjs \
+            scripts/ad-hoc/omniroute-governor-native-baseline.mjs \
+            scripts/ad-hoc/omniroute-governor-pair-state.mjs \
+            scripts/ad-hoc/omniroute-governor-benchmark-persistence.mjs \
+            scripts/ad-hoc/omniroute-governor-run-summarizer.mjs \
+            scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs \
+            scripts/quality/classify-pr-changes.mjs \
+            tests/unit/classify-pr-changes.test.ts \
+            tests/unit/omniroute-governor-target-identity.test.ts \
+            tests/unit/omniroute-governor-native-baseline.test.ts \
+            tests/unit/omniroute-governor-authoritative-gate-contract.test.ts \
+            .github/workflows/governor-harness.yml
