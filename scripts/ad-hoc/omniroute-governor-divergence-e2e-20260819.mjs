@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 
 import { queryGovernorTelemetryRows } from "../../src/lib/db/governorTelemetry.ts";
 import { getCachedProviderConnections, getCachedSettings } from "../../src/lib/db/readCache.ts";
@@ -40,6 +43,8 @@ import {
   nativeBaselineStateDigest,
   resolveNativeBaselineWithoutExecution,
 } from "./omniroute-governor-native-baseline.mjs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   canonicalTargetKey,
   evaluatePlannedConnectionIdentity,
@@ -62,6 +67,7 @@ const directOnly = process.argv.includes("--direct-only");
 const replayOnly = process.argv.includes("--replay-only");
 const e2eReplayOnly = process.argv.includes("--e2e-replay");
 const calibrationRecoveryOnly = process.argv.includes("--calibration-recovery");
+const routingParityOnly = process.argv.includes("--routing-parity-only");
 const authoritativeOnly = process.argv.includes("--authoritative-e2e");
 const requestedPairs = Number(
   process.argv.find((arg) => arg.startsWith("--pairs="))?.split("=")[1] || 10
@@ -75,6 +81,7 @@ const supportedCliFlags = new Set([
   "--replay-only",
   "--e2e-replay",
   "--calibration-recovery",
+  "--routing-parity-only",
   "--authoritative-e2e",
 ]);
 const unknownCliArgs = process.argv.slice(2).filter((arg) => {
@@ -2574,6 +2581,100 @@ if (poolOnly) {
     },
   });
   process.exit(0);
+}
+if (routingParityOnly) {
+  const workload = AUTHORITATIVE_WORKLOAD;
+  const baselineSnapshot = await createNativeBaselineSnapshot({
+    pool,
+    routingSettings: pool.routingSettings,
+  });
+  const workerPath = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "omniroute-governor-production-routing-parity-worker.mjs"
+  );
+  const parity = [];
+  for (const input of workload) {
+    const request = nativeBaselineRequest(input.id, input.prompt);
+    const baseline = resolveNativeBaselineWithoutExecution({
+      snapshot: baselineSnapshot,
+      request,
+    });
+    const isolatedDataDir = mkdtempSync(resolve(tmpdir(), "omniroute-routing-parity-"));
+    let child;
+    try {
+      child = spawnSync(process.execPath, ["--import", "tsx/esm", workerPath], {
+        cwd: dirname(dirname(dirname(workerPath))),
+        env: {
+          ...process.env,
+          DATA_DIR: isolatedDataDir,
+          NEXT_PHASE: "phase-production-build",
+          INTELLIGENCE_GOVERNOR_MODE: "off",
+          INTELLIGENCE_GOVERNOR_TELEMETRY: "false",
+          INTELLIGENCE_GOVERNOR_CANARY_RATE: "0",
+          OMNIROUTE_SKIP_DB_HEALTHCHECK: "1",
+        },
+        input: JSON.stringify({ snapshot: baselineSnapshot, request }),
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+      });
+    } finally {
+      rmSync(isolatedDataDir, { recursive: true, force: true });
+    }
+    const marker = "PRODUCTION_ROUTING_PARITY_RESULT:";
+    const line = (child.stdout || "")
+      .split(/\r?\n/)
+      .reverse()
+      .find((value) => value.startsWith(marker));
+    const production = line ? JSON.parse(line.slice(marker.length)) : null;
+    const pass =
+      baseline.valid === true &&
+      production?.ok === true &&
+      production.productionFirstCanonicalTarget === baseline.nativeBaselineCanonicalTarget &&
+      production.networkCallsBeforeIntercept === 0 &&
+      production.providerModelCalls === 0 &&
+      production.physicalDispatchPrevented === true &&
+      child.status === 0;
+    parity.push({
+      caseId: input.id,
+      category: input.category,
+      baselineCanonicalTarget: baseline.nativeBaselineCanonicalTarget,
+      productionFirstCanonicalTarget: production?.productionFirstCanonicalTarget ?? null,
+      productionEvidenceSource: production?.productionEvidenceSource ?? null,
+      preludeOwner: production?.preludeOwner ?? null,
+      orderedTargetCount: production?.orderedTargetCount ?? null,
+      networkCallsBeforeIntercept: production?.networkCallsBeforeIntercept ?? null,
+      providerModelCalls: production?.providerModelCalls ?? null,
+      physicalDispatchPrevented: production?.physicalDispatchPrevented ?? false,
+      pass,
+      workerExitCode: child.status,
+      workerStderr: child.stderr || "",
+    });
+  }
+  const passed = parity.filter((item) => item.pass).length;
+  outputDocument({
+    governor: "simulate / false / 0",
+    productionPath: {
+      handler: "handleComboChat",
+      targetResolution: "resolveComboTargetPipeline",
+      evidenceSource: "HANDLE_SINGLE_MODEL_INTERCEPT",
+      physicalDispatchPrevented: true,
+    },
+    baselineSnapshotId: baselineSnapshot.snapshotId,
+    baselineSnapshotHash: baselineSnapshot.baselineSnapshotHash,
+    parity,
+    summary: {
+      total: parity.length,
+      passed,
+      canonicalParity: `${passed}/${parity.length}`,
+      networkCallsBeforeIntercept: parity.reduce(
+        (sum, item) => sum + (item.networkCallsBeforeIntercept || 0),
+        0
+      ),
+      providerModelCalls: parity.reduce((sum, item) => sum + (item.providerModelCalls || 0), 0),
+      routingParityGate: passed === parity.length ? "PASS" : "FAIL",
+    },
+  });
+  process.exit(passed === parity.length ? 0 : 2);
 }
 if (directOnly || replayOnly) {
   const decisions = replayLatestDecisionsFromTelemetry();

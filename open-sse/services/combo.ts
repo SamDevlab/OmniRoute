@@ -588,6 +588,7 @@ export async function handleComboChat({
   nesting = null,
   hiddenModelsByProvider = getHiddenModelsByProvider(),
   correlationId = null,
+  buildAutoCandidates: buildAutoCandidatesOverride,
 }: HandleComboChatOptions): Promise<Response> {
   if (correlationId) {
     relayOptions = { ...(relayOptions ?? {}), governorCorrelationId: correlationId };
@@ -740,7 +741,7 @@ export async function handleComboChat({
     resilienceSettings,
     isModelAvailable,
     handleSingleModelWithTimeout,
-    buildAutoCandidates,
+    buildAutoCandidates: buildAutoCandidatesOverride || buildAutoCandidates,
     hiddenModelsByProvider,
   });
   if ("earlyResponse" in targetResolution) return targetResolution.earlyResponse;

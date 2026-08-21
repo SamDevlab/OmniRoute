@@ -28,6 +28,17 @@ const harnessPath = new URL(
   import.meta.url
 );
 const harnessSource = fs.readFileSync(harnessPath, "utf8");
+const productionParityWorkerSource = fs.readFileSync(
+  new URL(
+    "../../scripts/ad-hoc/omniroute-governor-production-routing-parity-worker.mjs",
+    import.meta.url
+  ),
+  "utf8"
+);
+const comboSource = fs.readFileSync(
+  new URL("../../open-sse/services/combo.ts", import.meta.url),
+  "utf8"
+);
 const pairStateSource = fs.readFileSync(
   new URL("../../scripts/ad-hoc/omniroute-governor-pair-state.mjs", import.meta.url),
   "utf8"
@@ -620,4 +631,33 @@ test("native call-log evidence excludes the virtual auto/chat summary row", () =
   assert.match(source, /entry\.provider !== "auto"/);
   assert.match(source, /entry\.model !== "auto\/chat"/);
   assert.match(source, /entry\.requestedModel !== "auto\/chat"/);
+});
+
+test("routing parity mode is fail-closed and runs before physical benchmark branches", () => {
+  const flagStart = harnessSource.indexOf("const routingParityOnly =");
+  const poolStart = harnessSource.indexOf("const pool = await buildPool()");
+  const parityStart = harnessSource.indexOf("if (routingParityOnly)");
+  const physicalStart = harnessSource.indexOf("if (authoritativeOnly)");
+  assert.ok(flagStart >= 0 && flagStart < poolStart);
+  assert.ok(parityStart > poolStart && parityStart < physicalStart);
+  assert.match(harnessSource, /--routing-parity-only/);
+  assert.match(harnessSource, /process\.exit\(passed === parity\.length \? 0 : 2\)/);
+});
+
+test("production parity worker intercepts handleSingleModel and blocks network/provider dispatch", () => {
+  assert.match(productionParityWorkerSource, /handleComboChat/);
+  assert.match(productionParityWorkerSource, /const handleSingleModel = async/);
+  assert.match(productionParityWorkerSource, /physicalDispatchPrevented: true/);
+  assert.match(productionParityWorkerSource, /networkCallsBeforeIntercept/);
+  assert.match(productionParityWorkerSource, /providerModelCalls: 0/);
+  assert.match(productionParityWorkerSource, /data: \[DONE\]/);
+});
+
+test("handleComboChat preserves the default builder and accepts only an optional diagnostic builder", () => {
+  assert.match(comboSource, /buildAutoCandidates: buildAutoCandidatesOverride/);
+  assert.match(
+    comboSource,
+    /buildAutoCandidates: buildAutoCandidatesOverride \|\| buildAutoCandidates/
+  );
+  assert.match(comboSource, /handleSingleModelWithTimeout/);
 });
