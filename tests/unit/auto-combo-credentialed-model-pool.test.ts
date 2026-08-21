@@ -104,6 +104,55 @@ test("credentialed providers expose one logical candidate per visible registry m
   }
 });
 
+test("credentialed providers expose models from an active synced catalog", async () => {
+  const connection = await providersDb.createProviderConnection({
+    provider: "openrouter",
+    authType: "apikey",
+    apiKey: "sk-test-openrouter",
+  });
+  await modelsDb.replaceSyncedAvailableModelsForConnection("openrouter", connection.id, [
+    { id: "openai/gpt-oss-20b:free", name: "GPT OSS 20B Free" },
+  ]);
+
+  const combo = await virtualFactory.createVirtualAutoCombo(undefined);
+  const candidate = combo.models.find(
+    (model) =>
+      model.providerId === "openrouter" && model.model === "openrouter/openai/gpt-oss-20b:free"
+  );
+
+  assert.ok(candidate, "an active synced model must be eligible for auto routing");
+  assert.deepEqual(candidate.allowedConnectionIds, [connection.id]);
+});
+
+test("synced model catalogs remain isolated between same-provider connections", async () => {
+  const first = await providersDb.createProviderConnection({
+    provider: "openrouter",
+    authType: "apikey",
+    apiKey: "sk-test-openrouter-a",
+  });
+  const second = await providersDb.createProviderConnection({
+    provider: "openrouter",
+    authType: "apikey",
+    apiKey: "sk-test-openrouter-b",
+  });
+  await modelsDb.replaceSyncedAvailableModelsForConnection("openrouter", first.id, [
+    { id: "model-a", name: "Model A" },
+    { id: "model-b", name: "Model B" },
+  ]);
+  await modelsDb.replaceSyncedAvailableModelsForConnection("openrouter", second.id, [
+    { id: "model-c", name: "Model C" },
+  ]);
+
+  const combo = await virtualFactory.createVirtualAutoCombo(undefined);
+  const candidates = combo.models.filter((model) => model.providerId === "openrouter");
+  const candidateFor = (modelId: string) =>
+    candidates.find((candidate) => candidate.model === `openrouter/${modelId}`);
+
+  assert.deepEqual(candidateFor("model-a")?.allowedConnectionIds, [first.id]);
+  assert.deepEqual(candidateFor("model-b")?.allowedConnectionIds, [first.id]);
+  assert.deepEqual(candidateFor("model-c")?.allowedConnectionIds, [second.id]);
+});
+
 test("candidate transparency expands a logical model into per-account rows", async () => {
   const { first, second } = await seedConnections();
 

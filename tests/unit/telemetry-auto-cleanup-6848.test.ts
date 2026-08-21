@@ -37,6 +37,8 @@ const {
   cleanupXpAuditLog,
   cleanupCompressionRunTelemetry,
 } = await import("../../src/lib/db/cleanup.ts");
+const { ensureCompressionRunTelemetryTable } =
+  await import("../../src/lib/db/compressionRunTelemetry.ts");
 
 const { getDbInstance, resetDbInstance } = await import("../../src/lib/db/core.ts");
 
@@ -50,31 +52,9 @@ test.after(() => {
 const DAY_SECONDS = 86_400;
 const DAY_MS = 86_400_000;
 
-/** Ensure compression_run_telemetry table exists (created lazily in production). */
-function ensureTelemetryTable(): void {
-  const db = getDbInstance()!;
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS compression_run_telemetry (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp INTEGER NOT NULL,
-      request_id TEXT,
-      model TEXT,
-      provider TEXT,
-      source TEXT,
-      tokens_before INTEGER NOT NULL,
-      tokens_after INTEGER NOT NULL,
-      ratio REAL,
-      cost_delta REAL,
-      output_styles TEXT,
-      output_style_bypass TEXT,
-      output_tokens INTEGER
-    )
-  `);
-}
-
 test.beforeEach(() => {
-  ensureTelemetryTable();
   const db = getDbInstance()!;
+  ensureCompressionRunTelemetryTable();
   for (const table of [
     "domain_cost_history",
     "compression_cache_stats",
@@ -158,7 +138,7 @@ test("#6848 cleanupXpAuditLog: deletes rows older than retention window", async 
 });
 
 test("#6848 cleanupCompressionRunTelemetry: deletes rows older than retention window", async () => {
-  ensureTelemetryTable();
+  ensureCompressionRunTelemetryTable();
   const db = getDbInstance()!;
   const now = Date.now();
   const nowSeconds = Math.floor(now / 1000);
@@ -181,8 +161,24 @@ test("#6848 cleanupCompressionRunTelemetry: deletes rows older than retention wi
   assert.strictEqual(remaining.cnt, 1);
 });
 
+test("#6848 cleanupCompressionRunTelemetry creates the lazy table when absent", async () => {
+  const db = getDbInstance()!;
+  db.exec("DROP TABLE compression_run_telemetry");
+
+  const result = await cleanupCompressionRunTelemetry();
+
+  assert.strictEqual(result.deleted, 0);
+  assert.strictEqual(result.errors, 0);
+  const table = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'compression_run_telemetry'"
+    )
+    .get() as { name: string } | undefined;
+  assert.strictEqual(table?.name, "compression_run_telemetry");
+});
+
 test("#6848 no rows deleted when all data is within retention window (calls all 4 real functions)", async () => {
-  ensureTelemetryTable();
+  ensureCompressionRunTelemetryTable();
   const db = getDbInstance()!;
   const nowSeconds = Math.floor(Date.now() / 1000);
   const nowMilliseconds = Date.now();

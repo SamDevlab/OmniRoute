@@ -414,6 +414,17 @@ test("createErrorResult — rawMessage never appears in the serialized response 
   );
 });
 
+test("createErrorResult rawMessage remains internal to fallback orchestration", async () => {
+  const { createErrorResult, getInternalRawErrorMessage } =
+    await import("../../open-sse/utils/error.ts");
+  const fullMessage = "Rate limit exceeded\nfree-models-per-day\nretry metadata";
+  const result = createErrorResult(429, fullMessage);
+
+  assert.equal(getInternalRawErrorMessage(result.response), fullMessage);
+  assert.equal(result.response.headers.has("x-omniroute-raw-error"), false);
+  assert.equal((await result.response.clone().text()).includes("free-models-per-day"), false);
+});
+
 test("buildModelCooldownBody returns the public cooldown error payload shape", async () => {
   const { buildModelCooldownBody } = await import("../../open-sse/utils/error.ts");
   const body = buildModelCooldownBody({ model: "gpt-4o", retryAfterSec: 1.2 });

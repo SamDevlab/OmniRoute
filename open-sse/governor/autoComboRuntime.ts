@@ -22,6 +22,11 @@ interface PricingEvidence {
   output: number;
 }
 
+export interface GovernorPricingResolution {
+  pricing: PricingEvidence | null;
+  pricingKnown: boolean;
+}
+
 export interface AutoComboGovernorRuntimeInput {
   body: Record<string, unknown>;
   promptText?: string;
@@ -95,6 +100,37 @@ async function getPricingEvidence(
   }
 }
 
+/**
+ * Resolve only factual zero-cost evidence when the pricing catalog has no row.
+ * `classifyTier` is deliberately gated by all three signals: a free tier,
+ * explicit free-tier evidence, and zero input/output costs. Unknown or paid
+ * models therefore retain the historical unknown-pricing behavior.
+ */
+export async function resolveGovernorPricingEvidence(
+  provider: string,
+  model: string,
+  explicitPricing?: PricingEvidence | null
+): Promise<GovernorPricingResolution> {
+  const pricing =
+    explicitPricing === undefined ? await getPricingEvidence(provider, model) : explicitPricing;
+  if (pricing) return { pricing, pricingKnown: true };
+
+  try {
+    const classification = classifyTier(provider, model);
+    if (
+      classification.tier === "free" &&
+      classification.hasFreeTier === true &&
+      classification.costPer1MInput === 0 &&
+      classification.costPer1MOutput === 0
+    ) {
+      return { pricing: { input: 0, output: 0 }, pricingKnown: true };
+    }
+  } catch {
+    // Preserve fail-closed unknown pricing if tier classification is unavailable.
+  }
+  return { pricing: null, pricingKnown: false };
+}
+
 function parseTarget(target: ResolvedComboTarget): { provider: string; model: string } {
   const parsed = parseModel(target.modelStr);
   return {
@@ -116,8 +152,14 @@ function mapPricingTier(provider: string, model: string, pricingKnown: boolean):
   return "preserve";
 }
 
-function candidateHealth(candidate: AutoProviderCandidate | undefined): number {
+export function resolveGovernorCandidateHealth(
+  candidate:
+    Pick<AutoProviderCandidate, "errorRate" | "failureRate" | "reliabilityObserved"> | undefined
+): number {
   if (!candidate) return 0.5;
+  if (candidate.reliabilityObserved === false) return 0.5;
+  const failureRate = toFiniteNonNegative(candidate.failureRate);
+  if (failureRate != null) return Math.max(0, Math.min(1, 1 - failureRate));
   const errorRate = toFiniteNonNegative(candidate.errorRate);
   if (errorRate == null) return 0.5;
   return Math.max(0, Math.min(1, 1 - errorRate));
@@ -211,17 +253,18 @@ async function buildCounterfactualCandidates(
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
-    const [pricing, capabilities] = await Promise.all([
-      getPricingEvidence(provider, model),
+    const [pricingResolution, capabilities] = await Promise.all([
+      resolveGovernorPricingEvidence(provider, model),
       Promise.resolve(getResolvedModelCapabilities({ provider, model })),
     ]);
+    const pricing = pricingResolution.pricing;
     const autoCandidate = findAutoCandidate(
       routableCandidates,
       provider,
       model,
       target.connectionId ?? null
     );
-    const tier = mapPricingTier(provider, model, pricing != null);
+    const tier = mapPricingTier(provider, model, pricingResolution.pricingKnown);
     const candidate: CounterfactualCandidate = {
       provider,
       model,
@@ -242,7 +285,7 @@ async function buildCounterfactualCandidates(
       // Compression is a local OmniRoute preprocessing control, not a provider API capability.
       supportsCompression: [...LOCAL_COMPRESSION_MODES],
       quotaState: quotaState(autoCandidate),
-      healthScore: candidateHealth(autoCandidate),
+      healthScore: resolveGovernorCandidateHealth(autoCandidate),
     };
     normalized.push(candidate);
 
@@ -282,12 +325,11 @@ export async function applyGovernorToAutoComboOrder(
     };
   }
 
-  // Shadow and simulate stay on the late observation hook in chatCore. Active
-  // modes must evaluate before dispatch because only they can change target order.
-  // This separation avoids double Governor decisions without altering the existing
-  // observation lifecycle.
+  // Shadow stays on the late observation hook in chatCore. Simulate must evaluate
+  // here as well so it receives the same factual Auto Combo pool as active mode;
+  // it still returns before any target order mutation.
   const mode = getGovernorMode();
-  if (mode === "off" || mode === "shadow" || mode === "simulate") {
+  if (mode === "off" || mode === "shadow") {
     return {
       orderedTargets: input.orderedTargets,
       context: null,
@@ -362,6 +404,15 @@ export async function applyGovernorToAutoComboOrder(
     },
     counterfactualInput
   );
+
+  if (mode === "simulate") {
+    return {
+      orderedTargets: input.orderedTargets,
+      context,
+      selectedExecutionKey: null,
+      applied: false,
+    };
+  }
 
   const breaker = getGovernorActiveBreaker();
   context.breakerState = breaker.getState();

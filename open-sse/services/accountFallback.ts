@@ -59,6 +59,7 @@ export { MODEL_LOCKOUT_EVICTION_CAP } from "./accountFallback/lockoutEviction.ts
 import { capScaledCooldownMs } from "./accountFallback/cooldownCap.ts";
 import { resolveApiKeyForbiddenFallback } from "./accountFallback/nonRetryableUpstream.ts";
 import * as exactModelLock from "./accountFallback/exactModelLock.ts";
+import { getNoAuthLockProviderId } from "../../src/sse/services/noAuthProviderSiblings";
 export type ProviderProfile = {
   baseCooldownMs: number;
   useUpstreamRetryHints: boolean;
@@ -426,7 +427,7 @@ const canonicalProviderCache = new Map<string, string>();
 function getCanonicalLockProvider(provider: string): string {
   let canonical = canonicalProviderCache.get(provider);
   if (!canonical) {
-    canonical = resolveProviderId(provider);
+    canonical = getNoAuthLockProviderId(resolveProviderId(provider));
     canonicalProviderCache.set(provider, canonical);
   }
   return canonical;
@@ -1319,6 +1320,7 @@ export function isDailyQuotaExhausted(errorText: string): boolean {
   return (
     lower.includes("today's quota") ||
     lower.includes("daily quota") ||
+    lower.includes("free-models-per-day") ||
     lower.includes("try again tomorrow")
   );
 }

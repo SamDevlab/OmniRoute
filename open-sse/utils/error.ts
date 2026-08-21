@@ -19,6 +19,28 @@ interface ErrorResponseBody {
   upstream_details?: Record<string, unknown> | null; // sanitized upstream provider body
 }
 
+const INTERNAL_RAW_ERROR_MESSAGE = Symbol.for("omniroute.internalRawErrorMessage");
+
+/**
+ * Keep the complete upstream error available to internal fallback orchestration without
+ * putting it in the client-visible response body or headers.
+ */
+export function attachInternalRawErrorMessage(response: Response, message: string): Response {
+  Object.defineProperty(response, INTERNAL_RAW_ERROR_MESSAGE, {
+    configurable: true,
+    enumerable: false,
+    value: message,
+  });
+  return response;
+}
+
+export function getInternalRawErrorMessage(response: Response): string | null {
+  const value = (response as Response & { [INTERNAL_RAW_ERROR_MESSAGE]?: unknown })[
+    INTERNAL_RAW_ERROR_MESSAGE
+  ];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 // Length cap protects against pathological inputs even before tokenization.
 const MAX_ERROR_LEN = 4096;
 const SOURCE_EXT = ["ts", "tsx", "js", "jsx", "mjs", "cjs"] as const;
@@ -595,6 +617,8 @@ export function createErrorResult(
     }
   }
 
+  attachInternalRawErrorMessage(result.response, message);
+
   return result;
 }
 
@@ -614,13 +638,17 @@ export function unavailableResponse(
 ) {
   const retryAfterSec = normalizeRetryAfterSeconds(retryAfter);
   const msg = retryAfterHuman ? `${message} (${retryAfterHuman})` : message;
-  return new Response(JSON.stringify({ error: { message: msg } }), {
-    status: statusCode,
-    headers: {
-      "Content-Type": "application/json",
-      "Retry-After": String(retryAfterSec),
-    },
-  });
+  const response = new Response(
+    JSON.stringify(buildErrorBody(statusCode, sanitizeErrorMessage(msg))),
+    {
+      status: statusCode,
+      headers: {
+        "Content-Type": "application/json",
+        "Retry-After": String(retryAfterSec),
+      },
+    }
+  );
+  return attachInternalRawErrorMessage(response, message);
 }
 
 export function providerCircuitOpenResponse(
@@ -690,11 +718,13 @@ export function modelCooldownResponse({
   retryAfter,
   retryAfterAt,
   credentialsCoolingCount,
+  internalRawErrorMessage,
 }: {
   model?: string | null;
   retryAfter?: string | number | Date | null;
   retryAfterAt?: string | null;
   credentialsCoolingCount?: number | null;
+  internalRawErrorMessage?: string | null;
 }) {
   const retryAfterSec = normalizeRetryAfterSeconds(retryAfter);
   const resolvedRetryAfterAt =
@@ -703,7 +733,7 @@ export function modelCooldownResponse({
       : typeof retryAfter === "string" && retryAfter.length > 0
         ? retryAfter
         : null;
-  return new Response(
+  const response = new Response(
     JSON.stringify(
       buildModelCooldownBody({
         model,
@@ -720,6 +750,9 @@ export function modelCooldownResponse({
       },
     }
   );
+  return internalRawErrorMessage
+    ? attachInternalRawErrorMessage(response, internalRawErrorMessage)
+    : response;
 }
 
 /**

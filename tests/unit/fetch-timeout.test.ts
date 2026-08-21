@@ -44,7 +44,7 @@ test("fetchWithTimeout forwards options and exposes the configured timeout", asy
   assert.equal(seenOptions.signal instanceof AbortSignal, true);
 });
 
-test("fetchWithTimeout converts both pre-aborted and externally aborted requests into FetchTimeoutError", async () => {
+test("fetchWithTimeout preserves pre-aborted and externally aborted requests", async () => {
   const mod = await loadFetchTimeoutModule("abort");
 
   const preAborted = new AbortController();
@@ -63,10 +63,8 @@ test("fetchWithTimeout converts both pre-aborted and externally aborted requests
       timeoutMs: 9,
     }),
     (error) => {
-      assert.equal(error instanceof mod.FetchTimeoutError, true);
-      assert.equal((error as any).timeoutMs, 9);
-      (assert as any).equal((error as any).url, "https://example.test/pre-aborted");
-      (assert as any).match((error as any).message, /timed out after 9ms/);
+      assert.equal(error instanceof mod.FetchTimeoutError, false);
+      assert.equal((error as Error).name, "AbortError");
       return true;
     }
   );
@@ -90,9 +88,36 @@ test("fetchWithTimeout converts both pre-aborted and externally aborted requests
     }),
     (error) => {
       assert.equal(fetchSawSignal, true);
+      assert.equal(error instanceof mod.FetchTimeoutError, false);
+      assert.equal((error as Error).name, "AbortError");
+      return true;
+    }
+  );
+});
+
+test("fetchWithTimeout converts only its own AbortError into FetchTimeoutError", async () => {
+  const mod = await loadFetchTimeoutModule("internal-timeout");
+
+  globalThis.fetch = async (_url, options) => {
+    await new Promise((_, reject) => {
+      options.signal.addEventListener(
+        "abort",
+        () => {
+          const error = new Error("aborted by timeout");
+          error.name = "AbortError";
+          reject(error);
+        },
+        { once: true }
+      );
+    });
+    throw new Error("unreachable");
+  };
+
+  await assert.rejects(
+    mod.fetchWithTimeout("https://example.test/internal-timeout", { timeoutMs: 10 }),
+    (error) => {
       assert.equal(error instanceof mod.FetchTimeoutError, true);
-      assert.equal((error as any).timeoutMs, 15);
-      assert.equal((error as any).url, "https://example.test/external-abort");
+      assert.equal((error as any).timeoutMs, 10);
       return true;
     }
   );

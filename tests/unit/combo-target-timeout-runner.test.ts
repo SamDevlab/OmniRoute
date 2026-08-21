@@ -67,7 +67,7 @@ test("sucesso rápido vence a corrida do timeout", async () => {
   assert.equal(await res.text(), "fast");
 });
 
-test("hedge do parent já abortado propaga o abort ao filho", async () => {
+test("hedge do parent já abortado propaga o abort ao filho sem virar erro 502", async () => {
   const parent = new AbortController();
   parent.abort(new Error("hedge-cancelled"));
   let sawAbort = false;
@@ -82,6 +82,60 @@ test("hedge do parent já abortado propaga o abort ao filho", async () => {
     log: noopLog,
   });
   const parentTarget: SingleModelTarget = { modelAbortSignal: parent.signal };
-  await runner({}, "m", parentTarget);
+  const res = await runner({}, "m", parentTarget);
   assert.equal(sawAbort, true);
+  assert.equal(res.status, 499);
+  const body = await res.json();
+  assert.equal(body?.error?.code, "combo_hedge_cancelled");
+});
+
+test("cancelamento de hedge encerra imediatamente e não espera o timeout do alvo", async () => {
+  const parent = new AbortController();
+  let sawAbort = false;
+  const runner = buildTargetTimeoutRunner({
+    handleSingleModel: (_b, _m, target) =>
+      new Promise<Response>((resolve) => {
+        target?.modelAbortSignal?.addEventListener(
+          "abort",
+          () => {
+            sawAbort = true;
+            resolve(new Response("late child result"));
+          },
+          { once: true }
+        );
+      }),
+    comboTargetTimeoutMs: 1000,
+    log: noopLog,
+  });
+  const promise = runner({}, "m", { modelAbortSignal: parent.signal });
+  setTimeout(() => parent.abort(new Error("hedge-cancelled")), 10);
+  const res = await promise;
+  assert.equal(sawAbort, true);
+  assert.equal(res.status, 499);
+  const body = await res.json();
+  assert.equal(body?.error?.type, "combo_hedge_cancelled");
+});
+
+test("deadline global usa o saldo restante e emite classificação do roteador", async () => {
+  let aborted = false;
+  const runner = buildTargetTimeoutRunner({
+    handleSingleModel: (_b, _m, target) =>
+      new Promise<Response>((resolve) => {
+        const sig = target?.modelAbortSignal;
+        sig?.addEventListener("abort", () => {
+          aborted = true;
+          resolve(new Response(null, { status: 599 }));
+        });
+      }),
+    comboTargetTimeoutMs: 1000,
+    globalDeadlineAtMs: Date.now() + 20,
+    log: noopLog,
+  });
+
+  const res = await runner({}, "slow-model");
+  assert.equal(res.status, 504);
+  assert.equal(res.headers.get("x-omniroute-combo-timeout"), "combo_global_timeout");
+  assert.equal(aborted, true);
+  const body = await res.json();
+  assert.equal(body?.error?.code, "combo_global_timeout");
 });

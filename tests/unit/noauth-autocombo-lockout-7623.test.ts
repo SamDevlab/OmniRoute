@@ -65,6 +65,23 @@ test("#7623: sibling no-auth models stay in the pool when only one model is lock
   );
 });
 
+test("#7623: opencode logical pool honors lockouts recorded by the routed opencode-zen provider", async () => {
+  accountFallback.lockModel("opencode-zen", "noauth", "big-pickle", "rate_limited", 60_000);
+
+  assert.equal(
+    accountFallback.isModelLocked("opencode", "noauth", "big-pickle"),
+    true,
+    "the logical opencode identity must observe the routed opencode-zen lockout"
+  );
+
+  const combo = await virtualFactory.createVirtualAutoCombo(undefined);
+  const modelStrings = combo.models.map((m: { model: string }) => m.model);
+  assert.ok(
+    !modelStrings.includes("opencode/big-pickle"),
+    "the logical candidate must be removed while the routed sibling is locked"
+  );
+});
+
 test("#7623: credentialed provider drops a connection from allowedConnectionIds when that model is locked", async () => {
   const tokenExpiresAt = new Date(Date.now() + 60_000).toISOString();
   const locked = await providersDb.createProviderConnection({

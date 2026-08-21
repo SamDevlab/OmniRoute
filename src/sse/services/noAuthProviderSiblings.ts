@@ -22,3 +22,20 @@ const NOAUTH_SIBLING_PROVIDER_IDS: Record<string, string[]> = {
 export function getNoAuthHydrationProviderIds(providerId: string): string[] {
   return [providerId, ...(NOAUTH_SIBLING_PROVIDER_IDS[providerId] || [])];
 }
+
+/**
+ * Return the shared lockout namespace for no-auth provider siblings. The routed
+ * OpenCode identities use the same synthetic `noauth` connection and upstream
+ * endpoint, so a model lock recorded under `opencode-zen` or `opencode-go`
+ * must also block the logical `opencode` pool.
+ */
+export function getNoAuthLockProviderId(providerId: string): string {
+  const hydrationSiblings = NOAUTH_SIBLING_PROVIDER_IDS[providerId];
+  if (hydrationSiblings?.[0]) return hydrationSiblings[0];
+
+  for (const siblings of Object.values(NOAUTH_SIBLING_PROVIDER_IDS)) {
+    if (siblings.includes(providerId)) return providerId;
+  }
+
+  return providerId;
+}

@@ -5,6 +5,9 @@ import { estimateFinalInputTokens } from "./chatCore/contextEstimation.ts";
 import { extractSystemRoleMessages } from "./chatCore/claudeSystemRole.ts";
 export { extractSystemRoleMessages } from "./chatCore/claudeSystemRole.ts";
 import { GovernorManager } from "../governor/governorManager.ts";
+import { getGovernorMode } from "@/shared/utils/featureFlags.ts";
+import { updateGovernorTelemetryOutcome } from "@/lib/db/governorTelemetry.ts";
+import { classifyGovernorStreamOutcome, elapsedMilliseconds } from "../governor/streamOutcome.ts";
 import type { GovernorInput, ModelTier } from "../governor/types.ts";
 import type { CounterfactualInput } from "../governor/counterfactual.ts";
 import { buildCounterfactualCandidates } from "../governor/catalogAdapter.ts";
@@ -1461,7 +1464,8 @@ export async function handleChatCore({
           },
         }
       );
-      delete (compressionInputBody as Record<string, unknown>).__omnirouteGovernorCompressionPreference;
+      delete (compressionInputBody as Record<string, unknown>)
+        .__omnirouteGovernorCompressionPreference;
       const mode = compressionPlan.mode as CompressionConfig["defaultMode"];
       if (adaptiveTelemetry && adaptiveTelemetry.fit === false) {
         log?.warn?.(
@@ -4793,6 +4797,31 @@ export async function handleChatCore({
     ttft,
   }) => {
     const normalizedStreamStatus = streamStatus || 200;
+    const usageRecord =
+      streamUsage && typeof streamUsage === "object"
+        ? (streamUsage as Record<string, unknown>)
+        : null;
+    const promptTokens = Number(usageRecord?.prompt_tokens ?? usageRecord?.input_tokens ?? NaN);
+    const outputTokens = Number(
+      usageRecord?.completion_tokens ?? usageRecord?.output_tokens ?? NaN
+    );
+    const hasPromptTokens = Number.isFinite(promptTokens) && promptTokens >= 0;
+    const hasOutputTokens = Number.isFinite(outputTokens) && outputTokens >= 0;
+    const terminalOutcome = classifyGovernorStreamOutcome(
+      normalizedStreamStatus,
+      streamError,
+      streamErrorCode
+    );
+    updateGovernorTelemetryOutcome(correlationId || traceId, {
+      actualProvider: provider,
+      actualModel: model,
+      actualPromptTokens: hasPromptTokens ? promptTokens : null,
+      actualOutputTokens: hasOutputTokens ? outputTokens : null,
+      actualTotalTokens: hasPromptTokens && hasOutputTokens ? promptTokens + outputTokens : null,
+      latencyMs: elapsedMilliseconds(startTime, Date.now()),
+      success: normalizedStreamStatus === 200 && !streamError,
+      errorCategory: terminalOutcome === "SUCCESS" ? undefined : terminalOutcome,
+    });
     if (streamCompletionRecorded) return;
     streamCompletionRecorded = true;
     if (normalizedStreamStatus !== 200) {
@@ -5084,47 +5113,71 @@ export async function handleChatCore({
   });
 
   // ── Intelligence Governor (Shadow Mode Evaluation) ──
-  try {
-    const governorInput: GovernorInput = {
-      correlationId: correlationId || traceId,
-      estimatedPromptTokens: governorEstimatedPromptTokens,
-      contextWindow: (extendedContext as { maxTokens?: number } | undefined)?.maxTokens ?? 128000,
-      contextUtilization:
-        governorEstimatedPromptTokens != null
-          ? governorEstimatedPromptTokens /
-            ((extendedContext as { maxTokens?: number } | undefined)?.maxTokens ?? 128000)
+  if (getGovernorMode() !== "simulate") {
+    try {
+      const governorInput: GovernorInput = {
+        correlationId: correlationId || traceId,
+        estimatedPromptTokens: governorEstimatedPromptTokens,
+        contextWindow: (extendedContext as { maxTokens?: number } | undefined)?.maxTokens ?? 128000,
+        contextUtilization:
+          governorEstimatedPromptTokens != null
+            ? governorEstimatedPromptTokens /
+              ((extendedContext as { maxTokens?: number } | undefined)?.maxTokens ?? 128000)
+            : undefined,
+        requestedMaxOutput: (body as { max_tokens?: number } | undefined)?.max_tokens,
+        toolCount: Array.isArray((body as { tools?: unknown[] } | undefined)?.tools)
+          ? (body as { tools: unknown[] }).tools.length
+          : 0,
+        messageCount: Array.isArray((body as { messages?: unknown[] } | undefined)?.messages)
+          ? (body as { messages: unknown[] }).messages.length
           : undefined,
-      requestedMaxOutput: (body as { max_tokens?: number } | undefined)?.max_tokens,
-      toolCount: Array.isArray((body as { tools?: unknown[] } | undefined)?.tools)
-        ? (body as { tools: unknown[] }).tools.length
-        : 0,
-      messageCount: Array.isArray((body as { messages?: unknown[] } | undefined)?.messages)
-        ? (body as { messages: unknown[] }).messages.length
-        : undefined,
-      rawPromptText: extractGovernorPromptText(body),
-      retryCount: undefined,
-    };
-    const counterfactualInput: CounterfactualInput = {
-      ...governorInput,
-      currentProvider: provider || undefined,
-      currentModel: model || undefined,
-      currentModelTier: null,
-      actualInputTokens: governorEstimatedPromptTokens ?? null,
-      actualOutputTokens: null,
-      currentCost: null,
-      requiredCapabilities: Array.isArray((body as { tools?: unknown[] } | undefined)?.tools) && (body as { tools: unknown[] }).tools.length > 0 ? ["tools"] : [],
-      candidates: buildCounterfactualCandidates([{ provider: provider || "unknown", model: model || "unknown", tier: "preserve" as ModelTier, available: true, capabilities: ["streaming", ...(Array.isArray((body as { tools?: unknown[] } | undefined)?.tools) ? ["tools"] : [])], quotaState: "unknown" }]),
-    };
-    GovernorManager.evaluateRequest(governorInput, {
-      provider: provider || "unknown",
-      model: model || "unknown",
-      routingStrategy: comboStrategy ?? (isCombo ? "auto_combo" : "direct"),
-      retryCount: null,
-      success: null,
-      latencyMs: null,
-    }, counterfactualInput);
-  } catch {
-    /* shadow governor failure never affects request flow */
+        rawPromptText: extractGovernorPromptText(body),
+        retryCount: undefined,
+      };
+      const counterfactualInput: CounterfactualInput = {
+        ...governorInput,
+        currentProvider: provider || undefined,
+        currentModel: model || undefined,
+        currentModelTier: null,
+        actualInputTokens: governorEstimatedPromptTokens ?? null,
+        actualOutputTokens: null,
+        currentCost: null,
+        requiredCapabilities:
+          Array.isArray((body as { tools?: unknown[] } | undefined)?.tools) &&
+          (body as { tools: unknown[] }).tools.length > 0
+            ? ["tools"]
+            : [],
+        candidates: buildCounterfactualCandidates([
+          {
+            provider: provider || "unknown",
+            model: model || "unknown",
+            tier: "preserve" as ModelTier,
+            available: true,
+            capabilities: [
+              "streaming",
+              ...(Array.isArray((body as { tools?: unknown[] } | undefined)?.tools)
+                ? ["tools"]
+                : []),
+            ],
+            quotaState: "unknown",
+          },
+        ]),
+      };
+      GovernorManager.evaluateRequest(
+        governorInput,
+        {
+          provider: provider || "unknown",
+          model: model || "unknown",
+          routingStrategy: comboStrategy ?? (isCombo ? "auto_combo" : "direct"),
+          retryCount: null,
+          success: null,
+          latencyMs: null,
+        },
+        counterfactualInput
+      );
+    } catch {
+      /* shadow governor failure never affects request flow */
+    }
   }
 
   return {

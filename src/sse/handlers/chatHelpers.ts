@@ -12,7 +12,9 @@ import {
   type ResourcePressureGuardResult,
 } from "@omniroute/open-sse/utils/resourcePressure.ts";
 import {
+  attachInternalRawErrorMessage,
   errorResponse,
+  getInternalRawErrorMessage,
   modelCooldownResponse,
   providerCircuitOpenResponse,
   unavailableResponse,
@@ -641,6 +643,7 @@ export function handleNoCredentials(
         retryAfterAt: typeof credentials.retryAfter === "string" ? credentials.retryAfter : null,
         credentialsCoolingCount:
           typeof credentials.connectionsCount === "number" ? credentials.connectionsCount : null,
+        internalRawErrorMessage: errorMsg,
       });
     }
 
@@ -954,12 +957,14 @@ export function withSelectedConnectionHeader(
     response.headers.set("X-OmniRoute-Selected-Connection-Id", connectionId);
     return response;
   } catch {
+    const rawMessage = getInternalRawErrorMessage(response);
     const cloned = new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
     });
     cloned.headers.set("X-OmniRoute-Selected-Connection-Id", connectionId);
+    if (rawMessage) attachInternalRawErrorMessage(cloned, rawMessage);
     return cloned;
   }
 }

@@ -8,6 +8,7 @@ import {
   applyComboTargetExhaustion,
   type ComboExhaustionSets,
 } from "../../../open-sse/services/combo/targetExhaustion.ts";
+import { checkFallbackError } from "../../../open-sse/services/accountFallback.ts";
 
 const log = { info() {}, warn() {}, error() {}, debug() {} };
 
@@ -51,6 +52,34 @@ test("marks provider exhausted when the fallback result signals quota exhaustion
   });
   assert.equal(exhausted, true);
   assert.ok(s.exhaustedProviders.has("test-dedup-provider"));
+  assert.equal(s.transientRateLimitedProviders.size, 0);
+});
+
+test("OpenRouter daily free-model quota exhausts the provider despite passthrough model scope", () => {
+  const message =
+    "[429]: Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day";
+  const fallbackResult = checkFallbackError(429, message, 0, null, "openrouter", null, null);
+  const s = sets();
+  const exhausted = applyComboTargetExhaustion(
+    target({
+      provider: "openrouter",
+      providerId: "openrouter",
+      modelStr: "openrouter/nvidia/nemotron-3.5-content-safety:free",
+    }),
+    {
+      ...baseOpts,
+      result: { status: 429 },
+      fallbackResult,
+      errorText: message,
+      rawModel: "nvidia/nemotron-3.5-content-safety:free",
+      structuredError: { code: "rate_limit_exceeded", type: "rate_limit_error" },
+      sets: s,
+    }
+  );
+
+  assert.equal(fallbackResult.dailyQuotaExhausted, true);
+  assert.equal(exhausted, true);
+  assert.ok(s.exhaustedProviders.has("openrouter"));
   assert.equal(s.transientRateLimitedProviders.size, 0);
 });
 

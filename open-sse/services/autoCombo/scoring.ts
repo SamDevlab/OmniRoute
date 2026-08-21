@@ -93,6 +93,8 @@ export interface ProviderCandidate {
   errorRate: number;
   /** Optional provider/model observed failure rate. Falls back to errorRate. */
   failureRate?: number;
+  /** True only when failureRate comes from persisted observed outcomes. */
+  reliabilityObserved?: boolean;
   /** T10: Optional account tier for priority boosting (Ultra > Pro > Free) */
   accountTier?: "ultra" | "pro" | "standard" | "free";
   /** T10: Optional quota reset interval in seconds (shorter = higher priority when same quota) */

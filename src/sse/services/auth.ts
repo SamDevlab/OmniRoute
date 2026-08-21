@@ -1990,7 +1990,16 @@ export async function markAccountUnavailable(
     // as-is — extending disableCooling to model lockout is a follow-up.
     const disableCooling = connProviderSpecificData.disableCooling === true;
 
-    const isPerModelQuotaProvider = hasPerModelQuota(provider, model, connectionPassthroughModels);
+    // OpenRouter's `free-models-per-day` response is account-wide even though
+    // OpenRouter otherwise multiplexes per-model passthrough traffic. Keep the
+    // connection cooldown for this explicit provider-wide signal so a later
+    // request cannot walk into the same connection's local 429 queue through a
+    // different free model.
+    const isExplicitOpenRouterDailyQuota =
+      provider === "openrouter" && fallbackResult.dailyQuotaExhausted === true;
+    const isPerModelQuotaProvider =
+      hasPerModelQuota(provider, model, connectionPassthroughModels) &&
+      !isExplicitOpenRouterDailyQuota;
     const isNvidiaModelGone = provider === "nvidia" && status === 410;
     const modelLockoutOptions = { maxCooldownMs: effectiveProviderProfile?.maxCooldownMs };
     if (

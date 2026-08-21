@@ -929,7 +929,7 @@ interface ComboErrorPayload {
   error: { code?: string; message: string };
 }
 
-test("handleComboChat global comboTimeoutMs stops iterating remaining targets and returns 504 with aggregated diagnostics", async () => {
+test("handleComboChat global comboTimeoutMs aborts the active target and skips remaining targets", async () => {
   const calls: string[] = [];
   const result = await handleComboChat({
     body: {},
@@ -937,17 +937,14 @@ test("handleComboChat global comboTimeoutMs stops iterating remaining targets an
       name: "timeout-combo",
       strategy: "priority",
       models: ["model-a", "model-b", "model-c"],
-      // An effectively-zero ceiling: the FIRST target still dispatches (the
-      // check only runs after a target completes), but by the time it
-      // resolves any nonzero elapsed time trips the timeout, so the loop
-      // must stop instead of trying model-b/model-c.
-      config: { maxRetries: 0, comboTimeoutMs: 1 },
+      // A short ceiling aborts the FIRST target at the combo deadline, so the
+      // loop must stop instead of trying model-b/model-c.
+      config: { maxRetries: 0, comboTimeoutMs: 20 },
     },
     handleSingleModel: async (_body: unknown, modelStr: string) => {
       calls.push(modelStr);
-      // A tiny real delay guarantees Date.now() advances past the 1ms ceiling
-      // before the post-target timeout check runs.
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      // The target never completes before the global deadline.
+      await new Promise((resolve) => setTimeout(resolve, 30));
       return errorResponse(500, `fail:${modelStr}`);
     },
     isModelAvailable: async () => true,
@@ -960,9 +957,42 @@ test("handleComboChat global comboTimeoutMs stops iterating remaining targets an
 
   assert.equal(result.status, 504);
   assert.equal(payload.error.code, "COMBO_TIMEOUT");
-  assert.match(payload.error.message, /Combo global timeout \(1ms\)/);
-  assert.match(payload.error.message, /model-a \(500\)/);
+  assert.match(payload.error.message, /Combo global timeout \(20ms\)/);
+  assert.doesNotMatch(payload.error.message, /model-a \(500\)/);
   assert.deepEqual(calls, ["model-a"], "remaining targets must be skipped once the timeout trips");
+});
+
+test("handleComboChat global comboTimeoutMs aborts an active target without health side effects", async () => {
+  const calls: string[] = [];
+  let targetAborted = false;
+  const result = await handleComboChat({
+    body: {},
+    combo: {
+      name: "active-timeout-combo",
+      strategy: "priority",
+      models: ["model-a", "model-b"],
+      config: { maxRetries: 0, comboTimeoutMs: 20 },
+    },
+    handleSingleModel: async (_body: unknown, modelStr: string, target) => {
+      calls.push(modelStr);
+      return new Promise<Response>((resolve) => {
+        target?.modelAbortSignal?.addEventListener("abort", () => {
+          targetAborted = true;
+          resolve(new Response(null, { status: 599 }));
+        });
+      });
+    },
+    isModelAvailable: async () => true,
+    log: createLog(),
+    settings: null,
+    allCombos: null,
+  });
+
+  const payload = (await result.json()) as ComboErrorPayload;
+  assert.equal(result.status, 504);
+  assert.equal(payload.error.code, "COMBO_TIMEOUT");
+  assert.deepEqual(calls, ["model-a"]);
+  assert.equal(targetAborted, true);
 });
 
 test("handleComboChat comboTimeoutMs=0 (default) never trips the global timeout, all targets still tried", async () => {

@@ -70,6 +70,9 @@ export interface CounterfactualExecutionPlan {
   liveActiveControl: boolean;
 }
 
+const RELIABLE_PREFERRED_CANDIDATE_FLOOR = 0.8;
+const TIER_ORDER: ModelTier[] = ["low", "medium", "high", "highest"];
+
 function supports(candidate: CounterfactualCandidate, required: string[]): boolean {
   return required.every((value) => candidate.capabilities.includes(value));
 }
@@ -86,10 +89,7 @@ function resolveCostUsage(input: CounterfactualInput): {
       basis: "ACTUAL_USAGE",
     };
   }
-  if (
-    input.estimatedInputTokensForCost != null &&
-    input.estimatedOutputTokensForCost != null
-  ) {
+  if (input.estimatedInputTokensForCost != null && input.estimatedOutputTokensForCost != null) {
     return {
       inputTokens: input.estimatedInputTokensForCost,
       outputTokens: input.estimatedOutputTokensForCost,
@@ -120,6 +120,45 @@ function quotaGuard(candidate: CounterfactualCandidate | undefined): GuardrailRe
   return "UNKNOWN";
 }
 
+function candidateHealthScore(candidate: CounterfactualCandidate): number {
+  const health = Number(candidate.healthScore);
+  if (!Number.isFinite(health)) return 0.5;
+  return Math.max(0, Math.min(1, health));
+}
+
+function tierDistance(candidate: CounterfactualCandidate, recommendedTier: ModelTier): number {
+  const candidateIndex = TIER_ORDER.indexOf(candidate.tier);
+  const recommendedIndex = TIER_ORDER.indexOf(recommendedTier);
+  if (candidateIndex < 0 || recommendedIndex < 0) return Number.MAX_SAFE_INTEGER;
+  return Math.abs(candidateIndex - recommendedIndex);
+}
+
+function selectCandidate(
+  suitable: CounterfactualCandidate[],
+  input: CounterfactualInput,
+  decision: GovernorDecision
+): CounterfactualCandidate | undefined {
+  const recommendedTier = decision.modelPolicy.recommendedTier;
+  if (recommendedTier === "preserve") {
+    return suitable.find((item) => item.model === input.currentModel);
+  }
+
+  const preferred = suitable.filter((item) => item.tier === recommendedTier);
+  const hasReliablePreferred = preferred.some(
+    (item) => candidateHealthScore(item) >= RELIABLE_PREFERRED_CANDIDATE_FLOOR
+  );
+  const candidatesToRank = hasReliablePreferred ? preferred : suitable;
+
+  return candidatesToRank
+    .map((candidate, index) => ({ candidate, index }))
+    .sort(
+      (a, b) =>
+        candidateHealthScore(b.candidate) - candidateHealthScore(a.candidate) ||
+        tierDistance(a.candidate, recommendedTier) - tierDistance(b.candidate, recommendedTier) ||
+        a.index - b.index
+    )[0]?.candidate;
+}
+
 export function resolveCounterfactualPlan(
   input: CounterfactualInput,
   decision: GovernorDecision
@@ -133,20 +172,11 @@ export function resolveCounterfactualPlan(
       supports(candidate, required)
   );
 
-  const candidate =
-    decision.modelPolicy.recommendedTier === "preserve"
-      ? suitable.find((item) => item.model === input.currentModel)
-      : suitable
-          .filter((item) => item.tier === decision.modelPolicy.recommendedTier)
-          .sort((a, b) => (b.healthScore ?? 0) - (a.healthScore ?? 0))[0];
+  const candidate = selectCandidate(suitable, input, decision);
 
   if (!candidate) unresolved.push("candidate");
 
-  const capability: GuardrailResult = candidate
-    ? "YES"
-    : suitable.length > 0
-      ? "UNKNOWN"
-      : "NO";
+  const capability: GuardrailResult = candidate ? "YES" : suitable.length > 0 ? "UNKNOWN" : "NO";
 
   const contextFits: GuardrailResult = !candidate
     ? "UNKNOWN"
@@ -166,8 +196,7 @@ export function resolveCounterfactualPlan(
           : "NO";
 
   const compressionSupported: GuardrailResult =
-    decision.compressionPolicy.mode === "none" ||
-    decision.compressionPolicy.mode === "preserve"
+    decision.compressionPolicy.mode === "none" || decision.compressionPolicy.mode === "preserve"
       ? "YES"
       : candidate?.supportsCompression == null
         ? "UNKNOWN"
@@ -262,7 +291,9 @@ export function resolveCounterfactualPlan(
         ? (savings / currentCost) * 100
         : null,
     tokenReductionOpportunity:
-      requestedMax != null && outputTokens != null ? Math.max(0, requestedMax - outputTokens) : null,
+      requestedMax != null && outputTokens != null
+        ? Math.max(0, requestedMax - outputTokens)
+        : null,
     confidence,
     executable,
     unresolvedFields: unresolved,

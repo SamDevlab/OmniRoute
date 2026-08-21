@@ -44,6 +44,11 @@ const QUOTA_PATTERNS: ReadonlyArray<RegExp> = [
   /hard.?limit/i,
   /plan.*limit/i,
 
+  // OpenRouter free-model daily account quota. The provider reports this as
+  // `free-models-per-day` inside an otherwise generic 429 message; it is a
+  // long-window quota signal, not a short request-rate throttle.
+  /free[-_ ]models[-_ ]per[-_ ]day/i,
+
   // Antigravity / Cloud Code quota exhaustion ("Individual quota reached.
   // Contact your administrator to enable overages. Resets in 164h27m24s.").
   // None of the patterns above match it, so the 429 was misclassified as a

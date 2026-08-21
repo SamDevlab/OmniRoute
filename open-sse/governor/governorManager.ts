@@ -55,7 +55,11 @@ function isLateObservationOnlyActiveInput(input?: CounterfactualInput): boolean 
   if (!input || input.candidates.length === 0) return true;
   if (input.candidates.length > 1) return false;
   const candidate = input.candidates[0];
-  return candidate.tier === "preserve" && candidate.provider === input.currentProvider && candidate.model === input.currentModel;
+  return (
+    candidate.tier === "preserve" &&
+    candidate.provider === input.currentProvider &&
+    candidate.model === input.currentModel
+  );
 }
 
 function emptyExecutionContext(
@@ -154,7 +158,12 @@ export class GovernorManager {
         mode,
         decisionLatencyMs: 0,
       };
-      const context = emptyExecutionContext(mode, input, actualContext, "active_requires_runtime_candidate_pool");
+      const context = emptyExecutionContext(
+        mode,
+        input,
+        actualContext,
+        "active_requires_runtime_candidate_pool"
+      );
       this.writeCachedEvaluation(cacheKey, { createdAt: Date.now(), result, context });
       return { result, context };
     }

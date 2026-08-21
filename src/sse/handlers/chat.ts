@@ -23,7 +23,7 @@ import {
 import { getCombo, getComboForModel, getModelInfo } from "../services/model";
 import { stripContextWindowSuffix } from "@omniroute/open-sse/services/model.ts";
 import { resolveBareModelToConnectionDefault } from "@omniroute/open-sse/services/model.ts";
-import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
+import { attachInternalRawErrorMessage, errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { getImageModelEntry } from "@omniroute/open-sse/config/imageRegistry.ts";
 import { acceptHeaderForcesStream } from "@omniroute/open-sse/utils/aiSdkCompat.ts";
 import { applyNoThinkingAlias } from "@omniroute/open-sse/utils/noThinkingAlias.ts";
@@ -263,16 +263,46 @@ async function dispatchGovernedSingleModel(
   isCombo: boolean
 ) {
   const mode = getGovernorMode();
-  const governed = !isCombo && (String(originalModel).startsWith("auto/") || originalModel === "auto");
+  const governed =
+    !isCombo && (String(originalModel).startsWith("auto/") || originalModel === "auto");
   const hasExplicitConnection =
-    typeof runtimeOptions.forcedConnectionId === "string" && runtimeOptions.forcedConnectionId.trim().length > 0;
+    typeof runtimeOptions.forcedConnectionId === "string" &&
+    runtimeOptions.forcedConnectionId.trim().length > 0;
   if (!governed || runtimeOptions.governorBypass || mode === "off" || hasExplicitConnection) {
-    return handleSingleModelChat(body, originalModel, clientRawRequest, request, comboName, apiKeyInfo, telemetry, { ...runtimeOptions, governorBypass: true }, comboStrategy, isCombo);
+    return handleSingleModelChat(
+      body,
+      originalModel,
+      clientRawRequest,
+      request,
+      comboName,
+      apiKeyInfo,
+      telemetry,
+      { ...runtimeOptions, governorBypass: true },
+      comboStrategy,
+      isCombo
+    );
   }
 
   try {
-    const original = await resolveModelOrError(originalModel, body, clientRawRequest?.endpoint, clientRawRequest?.headers);
-    if (original.error) return handleSingleModelChat(body, originalModel, clientRawRequest, request, comboName, apiKeyInfo, telemetry, { ...runtimeOptions, governorBypass: true }, comboStrategy, isCombo);
+    const original = await resolveModelOrError(
+      originalModel,
+      body,
+      clientRawRequest?.endpoint,
+      clientRawRequest?.headers
+    );
+    if (original.error)
+      return handleSingleModelChat(
+        body,
+        originalModel,
+        clientRawRequest,
+        request,
+        comboName,
+        apiKeyInfo,
+        telemetry,
+        { ...runtimeOptions, governorBypass: true },
+        comboStrategy,
+        isCombo
+      );
     const provider = original.provider;
     const model = original.model;
     const registryCandidates: CounterfactualCandidate[] = [];
@@ -299,19 +329,25 @@ async function dispatchGovernedSingleModel(
       requestedMaxOutput: body?.max_tokens,
       messageCount: Array.isArray(body?.messages) ? body.messages.length : undefined,
       toolCount: Array.isArray(body?.tools) ? body.tools.length : 0,
-      availableCandidates: registryCandidates.map((candidate) => candidate.routingModelId || `${candidate.provider}/${candidate.model}`),
+      availableCandidates: registryCandidates.map(
+        (candidate) => candidate.routingModelId || `${candidate.provider}/${candidate.model}`
+      ),
     };
-    const { result, context } = GovernorManager.evaluateRequest(input, {
-      provider,
-      model,
-      routingStrategy: "auto",
-      success: null,
-    }, {
-      ...input,
-      currentProvider: provider,
-      currentModel: model,
-      candidates: registryCandidates,
-    } as any);
+    const { result, context } = GovernorManager.evaluateRequest(
+      input,
+      {
+        provider,
+        model,
+        routingStrategy: "auto",
+        success: null,
+      },
+      {
+        ...input,
+        currentProvider: provider,
+        currentModel: model,
+        candidates: registryCandidates,
+      } as any
+    );
     const config = getGovernorRuntimeConfig();
     const breaker = getGovernorActiveBreaker();
     const canApply =
@@ -320,15 +356,34 @@ async function dispatchGovernedSingleModel(
       context.activeSelected &&
       (mode === "active" || mode === "active-canary") &&
       result.plan?.executable === true;
-    const selected = canApply ? registryCandidates.find((candidate) => candidate.provider === result.plan?.selectedProvider && candidate.model === result.plan?.selectedModel) : null;
+    const selected = canApply
+      ? registryCandidates.find(
+          (candidate) =>
+            candidate.provider === result.plan?.selectedProvider &&
+            candidate.model === result.plan?.selectedModel
+        )
+      : null;
     if (selected?.routingModelId && selected.routingModelId !== originalModel) {
-      const resolved = await resolveModelOrError(selected.routingModelId, body, clientRawRequest?.endpoint, clientRawRequest?.headers);
+      const resolved = await resolveModelOrError(
+        selected.routingModelId,
+        body,
+        clientRawRequest?.endpoint,
+        clientRawRequest?.headers
+      );
       if (!resolved.error) {
         const allowed = runtimeOptions.allowedConnectionIds ?? null;
-        const credentials = await getProviderCredentialsWithQuotaPreflight(resolved.provider, null, allowed, resolved.model, {
-          sessionKey: runtimeOptions.sessionAffinityKey ?? runtimeOptions.sessionId ?? null,
-          ...(runtimeOptions.forcedConnectionId ? { forcedConnectionId: runtimeOptions.forcedConnectionId } : {}),
-        });
+        const credentials = await getProviderCredentialsWithQuotaPreflight(
+          resolved.provider,
+          null,
+          allowed,
+          resolved.model,
+          {
+            sessionKey: runtimeOptions.sessionAffinityKey ?? runtimeOptions.sessionId ?? null,
+            ...(runtimeOptions.forcedConnectionId
+              ? { forcedConnectionId: runtimeOptions.forcedConnectionId }
+              : {}),
+          }
+        );
         if (
           credentials &&
           !credentials.allRateLimited &&
@@ -337,25 +392,62 @@ async function dispatchGovernedSingleModel(
           "connectionId" in credentials &&
           Boolean(credentials.connectionId)
         ) {
-          const selectedResponse = await handleSingleModelChat(body, selected.routingModelId, clientRawRequest, request, comboName, apiKeyInfo, telemetry, {
-            ...runtimeOptions,
-            governorBypass: true,
-            preselectedCredentials: credentials,
-          }, comboStrategy, isCombo);
+          const selectedResponse = await handleSingleModelChat(
+            body,
+            selected.routingModelId,
+            clientRawRequest,
+            request,
+            comboName,
+            apiKeyInfo,
+            telemetry,
+            {
+              ...runtimeOptions,
+              governorBypass: true,
+              preselectedCredentials: credentials,
+            },
+            comboStrategy,
+            isCombo
+          );
           if (selectedResponse.ok) {
             breaker.recordSuccess();
             return selectedResponse;
           }
           breaker.recordFailure();
-          if (selectedResponse.status < 500 || selectedResponse.status >= 600) return selectedResponse;
-          return handleSingleModelChat(body, originalModel, clientRawRequest, request, comboName, apiKeyInfo, telemetry, { ...runtimeOptions, governorBypass: true }, comboStrategy, isCombo);
+          if (selectedResponse.status < 500 || selectedResponse.status >= 600)
+            return selectedResponse;
+          return handleSingleModelChat(
+            body,
+            originalModel,
+            clientRawRequest,
+            request,
+            comboName,
+            apiKeyInfo,
+            telemetry,
+            { ...runtimeOptions, governorBypass: true },
+            comboStrategy,
+            isCombo
+          );
         }
       }
     }
   } catch (error) {
-    log.warn("GOVERNOR", `Active route degraded to original: ${error instanceof Error ? error.message : "unknown"}`);
+    log.warn(
+      "GOVERNOR",
+      `Active route degraded to original: ${error instanceof Error ? error.message : "unknown"}`
+    );
   }
-  return handleSingleModelChat(body, originalModel, clientRawRequest, request, comboName, apiKeyInfo, telemetry, { ...runtimeOptions, governorBypass: true }, comboStrategy, isCombo);
+  return handleSingleModelChat(
+    body,
+    originalModel,
+    clientRawRequest,
+    request,
+    comboName,
+    apiKeyInfo,
+    telemetry,
+    { ...runtimeOptions, governorBypass: true },
+    comboStrategy,
+    isCombo
+  );
 }
 
 export { shouldTripProviderBreakerForResult } from "./chatPredicates";
@@ -1640,6 +1732,10 @@ async function handleSingleModelChat(
         return execution.localResourcePressureResult.response;
       }
       const { result, tlsFingerprintUsed } = execution;
+      if (!result.success && typeof result.rawMessage === "string") {
+        attachInternalRawErrorMessage(result.response, result.rawMessage);
+      }
+      const errorStr = String(result.rawMessage ?? result.error ?? "");
 
       const proxyLatency = Date.now() - proxyStartTime;
       const providerAlias = PROVIDER_ID_TO_ALIAS[provider] || provider;
@@ -1846,9 +1942,13 @@ async function handleSingleModelChat(
           `Account ${accountId}... at local concurrency cap, trying fallback account`
         );
         excludedConnectionIds.add(credentials.connectionId);
-        lastError = result.error;
+        // Preserve the complete internal classification text across the
+        // account-fallback boundary. The client response remains sanitized by
+        // errorResponse(), while combo orchestration still needs provider-wide
+        // quota markers such as OpenRouter's free-models-per-day signal.
+        lastError = errorStr;
         lastStatus = result.status;
-        requestRetryLastError = result.error;
+        requestRetryLastError = errorStr;
         requestRetryLastStatus = result.status;
         continue;
       }
@@ -1928,7 +2028,6 @@ async function handleSingleModelChat(
       // (truncated to its first line for the client response body) — Gemini's
       // TPM/RPD metric name and retry hint live on lines 2-3, after the
       // generic "quota exceeded" preamble on line 1.
-      const errorStr = String(result.rawMessage ?? result.error ?? "");
       const failureKind =
         result.status === 429
           ? isSubscriptionQuotaText(errorStr.toLowerCase(), provider)

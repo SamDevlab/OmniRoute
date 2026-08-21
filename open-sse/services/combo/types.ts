@@ -7,6 +7,8 @@
  */
 
 import type { ProviderCandidate } from "../autoCombo/scoring.ts";
+import type { ResilienceSettings } from "../../../src/lib/resilience/settings";
+import type { ResetWindowConfig } from "./quotaScoring.ts";
 
 export const RESET_WINDOW_NAMES = ["weekly", "session", "monthly"] as const;
 
@@ -67,6 +69,14 @@ export type HandleSingleModel = (
   target?: SingleModelTarget
 ) => Promise<Response>;
 
+export type BuildAutoCandidates = (
+  targets: ResolvedComboTarget[],
+  comboName: string,
+  sessionId?: string | null,
+  resetWindowConfig?: ResetWindowConfig,
+  resilienceSettings?: ResilienceSettings | null
+) => Promise<AutoProviderCandidate[]>;
+
 export type IsModelAvailable = (
   modelStr: string,
   target?: ResolvedComboTarget & { allowRateLimitedConnection?: boolean }
@@ -114,6 +124,8 @@ export type HandleComboChatOptions = {
   hiddenModelsByProvider?: HiddenModelsByProvider;
   /** Internal request identity; never forwarded upstream. */
   correlationId?: string | null;
+  /** Diagnostic-only frozen candidate seam; production uses the default builder. */
+  buildAutoCandidates?: BuildAutoCandidates;
 };
 
 export type HandleRoundRobinOptions = Omit<

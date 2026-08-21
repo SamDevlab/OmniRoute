@@ -210,6 +210,24 @@ test("#6638: checkFallbackError classifies API-key 429 explicit quota text as qu
   assert.equal(result.cooldownMs, 125);
 });
 
+test("OpenRouter free-model daily quota uses the daily quota fallback", () => {
+  const result = checkFallbackError(
+    429,
+    "[429]: Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+    0,
+    null,
+    "openrouter",
+    null,
+    makeProfile()
+  );
+
+  assert.equal(result.shouldFallback, true);
+  assert.equal(result.reason, RateLimitReason.QUOTA_EXHAUSTED);
+  assert.equal(result.dailyQuotaExhausted, true);
+  assert.ok(result.cooldownMs > 0);
+  assert.ok(result.cooldownMs <= 24 * 60 * 60 * 1000);
+});
+
 test("checkFallbackError honors Retry-After header for rate limits", () => {
   withMockedNow(1_700_000_000_000, () => {
     const headers = new Headers({ "retry-after": "120" });

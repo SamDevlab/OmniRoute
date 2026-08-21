@@ -19,6 +19,8 @@ import {
 import type { AutoVariant } from "./autoPrefix";
 import { buildFamilyCandidateFilter, type ModelFamily } from "./modelFamily";
 import { getHiddenModelsByProvider } from "@/models";
+import { getSyncedAvailableModelsByConnection } from "@/lib/db/models";
+import { getActiveSyncedCatalog } from "@/lib/db/models/activeSyncedCatalog";
 import { filterPaidOnlyCandidates } from "./paidModelFilter";
 import { isModelExcludedByConnection } from "@/domain/connectionModelRules";
 import { filterExcludedCandidates } from "./candidateOverrides";
@@ -374,11 +376,19 @@ export async function createVirtualAutoCombo(
           .map((model) => (typeof model?.id === "string" ? model.id.trim() : ""))
           .filter(Boolean)
       : [];
-    const registryModelIdSet = new Set(registryModelIds);
     const defaultModelIds = providerConnections
       .map((conn) => (typeof conn.defaultModel === "string" ? conn.defaultModel.trim() : ""))
       .filter(Boolean);
-    const modelIds = Array.from(new Set([...registryModelIds, ...defaultModelIds]));
+    const syncedModelsByConnection = await getSyncedAvailableModelsByConnection(providerId);
+    const syncedModelIds = providerConnections.flatMap((connection) =>
+      (syncedModelsByConnection[connection.id] || []).map((model) => model.id)
+    );
+    const activeSyncedCatalog = await getActiveSyncedCatalog(providerId);
+    const effectiveRegistryModelIds = activeSyncedCatalog.authoritative ? [] : registryModelIds;
+    const effectiveRegistryModelIdSet = new Set(effectiveRegistryModelIds);
+    const modelIds = Array.from(
+      new Set([...effectiveRegistryModelIds, ...syncedModelIds, ...defaultModelIds])
+    );
     const hiddenModels = hiddenModelsMap.get(providerId);
 
     for (const modelId of modelIds) {
@@ -389,7 +399,14 @@ export async function createVirtualAutoCombo(
           if (isModelExcludedByConnection(modelId, conn.providerSpecificData)) return false;
           // Registry models are provider-wide. A non-registry default (for a custom
           // or passthrough model) is scoped only to connections that selected it.
-          return registryModelIdSet.has(modelId) || conn.defaultModel?.trim() === modelId;
+          const connectionSyncedModelIds = new Set(
+            (syncedModelsByConnection[conn.id] || []).map((model) => model.id)
+          );
+          return (
+            effectiveRegistryModelIdSet.has(modelId) ||
+            connectionSyncedModelIds.has(modelId) ||
+            conn.defaultModel?.trim() === modelId
+          );
         })
         .map((conn) => conn.id);
       if (allowedConnectionIds.length === 0) continue;
@@ -427,10 +444,7 @@ export async function createVirtualAutoCombo(
   for (const conn of [...connections, ...disabledNoAuthConnections]) {
     connectionsById.set(conn.id, conn);
   }
-  const resilienceFilteredPool = filterResilienceBlockedCandidates(
-    candidatePool,
-    connectionsById
-  );
+  const resilienceFilteredPool = filterResilienceBlockedCandidates(candidatePool, connectionsById);
   if (resilienceFilteredPool !== candidatePool) {
     candidatePool.length = 0;
     candidatePool.push(...resilienceFilteredPool);

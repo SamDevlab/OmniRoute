@@ -31,6 +31,8 @@ process.env.API_KEY_SECRET = process.env.API_KEY_SECRET || "combo-speed-telemetr
 
 const { deriveSpeedTelemetry } = await import("../../open-sse/services/combo/autoStrategy.ts");
 const { buildAutoCandidates } = await import("../../open-sse/services/combo.ts");
+const { resolveGovernorCandidateHealth } =
+  await import("../../open-sse/governor/autoComboRuntime.ts");
 const { saveRequestUsage } = await import("../../src/lib/usage/usageHistory.ts");
 const core = await import("../../src/lib/db/core.ts");
 
@@ -172,6 +174,18 @@ before(async () => {
       timestamp: new Date(now - i * 1000).toISOString(),
     });
   }
+
+  for (let i = 0; i < 3; i++) {
+    await saveRequestUsage({
+      provider: "reliability-provider-6875",
+      model: "reliability-model-6875",
+      success: false,
+      status: "429",
+      errorCode: "rate_limit",
+      latencyMs: 2000,
+      timestamp: new Date(now - i * 1000).toISOString(),
+    });
+  }
 });
 
 test("buildAutoCandidates: candidate carries avgTtftMs/avgE2ELatencyMs/avgTokensPerSecond from real historical stats (speedTelemetry spread)", async () => {
@@ -218,9 +232,7 @@ test("buildAutoCandidates: candidate carries avgTtftMs/avgE2ELatencyMs/avgTokens
   // slipped past the positive() guard).
   assert.ok(typeof candidate!.avgTtftMs === "number" && candidate!.avgTtftMs > 0);
   assert.ok(typeof candidate!.avgE2ELatencyMs === "number" && candidate!.avgE2ELatencyMs > 0);
-  assert.ok(
-    typeof candidate!.avgTokensPerSecond === "number" && candidate!.avgTokensPerSecond > 0
-  );
+  assert.ok(typeof candidate!.avgTokensPerSecond === "number" && candidate!.avgTokensPerSecond > 0);
 });
 
 test("buildAutoCandidates: a provider/model with no historical signal omits the speed-telemetry fields", async () => {
@@ -253,4 +265,35 @@ test("buildAutoCandidates: a provider/model with no historical signal omits the 
   assert.strictEqual(candidate!.avgTtftMs, undefined);
   assert.strictEqual(candidate!.avgE2ELatencyMs, undefined);
   assert.strictEqual(candidate!.avgTokensPerSecond, undefined);
+  assert.equal(candidate!.reliabilityObserved, false);
+  assert.equal(candidate!.failureRate, undefined);
+  assert.equal(resolveGovernorCandidateHealth(candidate), 0.5);
+});
+
+test("buildAutoCandidates: observed recent failures override the optimistic error default", async () => {
+  const candidates = await buildAutoCandidates(
+    [
+      {
+        kind: "model" as const,
+        stepId: "s1",
+        executionKey: "reliability-provider-6875>reliability-model-6875",
+        modelStr: "reliability-provider-6875/reliability-model-6875",
+        provider: "reliability-provider-6875",
+        providerId: null,
+        connectionId: null,
+        weight: 1,
+        label: null,
+      },
+    ],
+    "reliability-test-combo",
+    null,
+    undefined,
+    { quotaPreflight: { enabled: false } } as never
+  );
+  const candidate = candidates[0];
+  assert.ok(candidate);
+  assert.equal(candidate.reliabilityObserved, true);
+  assert.equal(candidate.failureRate, 1);
+  assert.equal(candidate.errorRate, 0.05);
+  assert.equal(resolveGovernorCandidateHealth(candidate), 0);
 });

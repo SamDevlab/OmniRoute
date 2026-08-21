@@ -151,11 +151,10 @@ const DEFAULT_COMBO_CONFIG = {
   pipeline_fallback: "single-provider",
   resetAwareQuotaCacheTtlMs: 0,
   resetAwareQuotaCacheMaxStaleMs: 0,
-  // Global combo timeout (0 = disabled). When set, limits the total wall-clock time
-  // the combo spends iterating through targets. After each target completes, if the
-  // elapsed time exceeds comboTimeoutMs, remaining targets are skipped and a 504 with
-  // aggregated error diagnostics is returned. Backward-compatible: 0 preserves the
-  // legacy unlimited-iteration behavior.
+  // Global fallback budget (0 = disabled). When set, the sequential fallback phase
+  // uses an absolute deadline: active target timeouts and retry/fallback waits consume
+  // the remaining budget, and remaining targets are skipped after expiry. Backward-
+  // compatible: 0 preserves the legacy unlimited-iteration behavior.
   comboTimeoutMs: 0,
   shadowRouting: {
     enabled: false,

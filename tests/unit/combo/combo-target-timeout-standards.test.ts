@@ -20,8 +20,11 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 process.env.API_KEY_SECRET = process.env.API_KEY_SECRET || "combo-target-timeout-std-secret";
 
 const { handleComboChat } = await import("../../../open-sse/services/combo.ts");
-const { isComboRequestScopedFailure, shouldRecordProviderBreakerFailure } =
-  await import("../../../open-sse/services/combo/comboPredicates.ts");
+const {
+  isComboRequestScopedFailure,
+  isRequestScopedUpstreamFailure,
+  shouldRecordProviderBreakerFailure,
+} = await import("../../../open-sse/services/combo/comboPredicates.ts");
 const { applyComboTargetExhaustion } =
   await import("../../../open-sse/services/combo/targetExhaustion.ts");
 const { getProviderBreakerState } = await import("../../../open-sse/services/accountFallback.ts");
@@ -112,6 +115,38 @@ test("decision seam: typed combo_target_timeout 504 is request-scoped and does n
   );
 });
 
+test("decision seam: typed combo_global_timeout 504 is request-scoped and does not record breaker failure", () => {
+  const decision = decideProviderBreakerRecord({
+    status: 504,
+    errorText: "Combo global timeout for openai/slow",
+    structuredError: { code: "combo_global_timeout", type: "combo_global_timeout" },
+    sameProviderNext: false,
+  });
+  assert.equal(decision.requestScopedFailure, true);
+  assert.equal(
+    decision.shouldRecord,
+    false,
+    "router-owned global timeout must not trip the provider circuit breaker"
+  );
+});
+
+test("decision seam: cancelled hedge is request-scoped and does not record provider failure", () => {
+  assert.equal(
+    isRequestScopedUpstreamFailure({
+      code: "combo_hedge_cancelled",
+      type: "combo_hedge_cancelled",
+    }),
+    true
+  );
+  const decision = decideProviderBreakerRecord({
+    status: 499,
+    errorText: "Combo hedge cancelled",
+    structuredError: { code: "combo_hedge_cancelled", type: "combo_hedge_cancelled" },
+  });
+  assert.equal(decision.requestScopedFailure, true);
+  assert.equal(decision.shouldRecord, false);
+});
+
 test("decision seam: generic upstream 504 is NOT request-scoped and still records breaker failure", () => {
   const decision = decideProviderBreakerRecord({
     status: 504,
@@ -169,6 +204,22 @@ test("exhaustion: typed combo_target_timeout 504 does not poison connection; gen
   });
   assert.equal(localSets.exhaustedConnections.size, 0);
   assert.equal(localSets.exhaustedProviders.size, 0);
+
+  const globalSets = {
+    exhaustedProviders: new Set<string>(),
+    exhaustedConnections: new Set<string>(),
+    transientRateLimitedProviders: new Set<string>(),
+  };
+  applyComboTargetExhaustion(resolvedTarget(), {
+    ...base,
+    result: { status: 504, headers: null },
+    errorText: "Combo global timeout for openai/slow",
+    rawModel: "gpt-4o-mini",
+    structuredError: { code: "combo_global_timeout", type: "combo_global_timeout" },
+    sets: globalSets,
+  });
+  assert.equal(globalSets.exhaustedConnections.size, 0);
+  assert.equal(globalSets.exhaustedProviders.size, 0);
 
   const upstreamSets = {
     exhaustedProviders: new Set<string>(),

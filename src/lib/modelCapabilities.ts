@@ -17,7 +17,10 @@ import { getModelCapabilityOverride } from "@/lib/db/modelCapabilityOverrides";
 import { getDbInstance } from "@/lib/db/core";
 import { getKeyValue } from "@/lib/db/models/shared";
 import { isVisionModelId } from "@/shared/constants/visionModels";
-import { getUnsupportedParams } from "@omniroute/open-sse/config/providerRegistry.ts";
+import {
+  getRegistryEntry,
+  getUnsupportedParams,
+} from "@omniroute/open-sse/config/providerRegistry.ts";
 import {
   getLearnedThinkingCap,
   GEMINI_FALLBACK_THINKING_CAP,
@@ -633,6 +636,7 @@ export function getResolvedModelCapabilities(
   const usePersistedOverrides = options?.persistedOverrides !== false;
   const resolved = resolveCapabilityInput(input);
   const spec = getStaticSpec(resolved.model, resolved.rawModel);
+  const registryEntry = resolved.provider ? getRegistryEntry(resolved.provider) : null;
   const registryModel = getRegistryModel(resolved.provider, resolved.model);
   const synced = getSyncedCapabilityForResolved(
     resolved.provider,
@@ -691,6 +695,9 @@ export function getResolvedModelCapabilities(
     authoritativeContextWindow ??
     synced?.limit_context ??
     (typeof registryModel?.contextLength === "number" ? registryModel.contextLength : null) ??
+    (typeof registryEntry?.defaultContextLength === "number"
+      ? registryEntry.defaultContextLength
+      : null) ??
     spec?.contextWindow ??
     null;
 

@@ -96,6 +96,9 @@ antigravity-manager-analysis/
 .sisyphus/
 .plans/
 
+# Governor benchmark run artifacts (runtime evidence is local-only)
+/docs/diagnostics/governor-e2e-artifacts/
+
 # open-sse tests
 open-sse/test/*
 

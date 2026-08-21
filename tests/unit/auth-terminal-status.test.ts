@@ -63,6 +63,32 @@ test("getProviderCredentials returns null when all active connections are termin
   assert.equal(selected, null);
 });
 
+test("OpenRouter free-model daily quota cools the connection, not only one model", async () => {
+  await resetStorage();
+
+  const conn = await providersDb.createProviderConnection({
+    provider: "openrouter",
+    authType: "apikey",
+    apiKey: "test-openrouter-key",
+    isActive: true,
+    testStatus: "active",
+  });
+  const result = await auth.markAccountUnavailable(
+    conn.id,
+    429,
+    "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock free model requests per day",
+    "openrouter",
+    "nvidia/nemotron-nano-9b-v2:free"
+  );
+  const after = await providersDb.getProviderConnectionById(conn.id);
+
+  assert.equal(result.shouldFallback, true);
+  assert.ok(result.cooldownMs > 0);
+  assert.equal(after?.testStatus, "unavailable");
+  assert.ok(after?.rateLimitedUntil);
+  assert.ok(new Date(after.rateLimitedUntil as string).getTime() > Date.now());
+});
+
 test("getProviderCredentials can reuse a locally suppressed connection for combo live tests", async () => {
   await resetStorage();
 

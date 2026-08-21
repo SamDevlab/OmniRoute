@@ -121,6 +121,62 @@ test("active canary requires high confidence, known non-increasing cost and sele
   );
 });
 
+test("simulate evaluates the same factual Auto Combo pool without reordering it", async () => {
+  const oldEnv = { ...process.env };
+  try {
+    process.env.INTELLIGENCE_GOVERNOR_MODE = "simulate";
+    process.env.GOVERNOR_ACTIVE_ENABLED = "false";
+    process.env.GOVERNOR_ACTIVE_CANARY_RATE = "0";
+    GovernorManager.clearEvaluationCacheForTests();
+
+    const target = (provider: string, model: string, key: string) => ({
+      kind: "model" as const,
+      stepId: key,
+      executionKey: key,
+      modelStr: `${provider}/${model}`,
+      provider,
+      providerId: null,
+      connectionId: key,
+      weight: 1,
+      label: null,
+    });
+    const native = target("opencode", "big-pickle", "native");
+    const other = target("felo-web", "felo-chat", "other");
+    const result = await applyGovernorToAutoComboOrder({
+      body: { messages: [{ role: "user", content: "simulate pool" }], max_tokens: 128 },
+      promptText: "simulate pool",
+      estimatedInputTokens: 64,
+      taskType: "chat",
+      correlationId: "simulate-factual-pool",
+      nativeSelectedTarget: native,
+      orderedTargets: [native, other],
+      routableCandidates: [
+        { provider: "opencode", model: "big-pickle", connectionId: "native" },
+        { provider: "felo-web", model: "felo-chat", connectionId: "other" },
+      ],
+    });
+
+    assert.equal(result.applied, false);
+    assert.deepEqual(
+      result.orderedTargets.map((item) => item.executionKey),
+      ["native", "other"]
+    );
+    assert.ok(result.context?.plan);
+    assert.notEqual(result.context?.plan?.selectedProvider, null);
+    assert.notEqual(result.context?.plan?.selectedModel, null);
+    assert.equal(result.context?.plan?.estimatedCurrentCost, 0);
+    assert.equal(result.context?.plan?.estimatedCounterfactualCost, 0);
+    assert.equal(result.context?.plan?.costEstimateBasis, "PRE_REQUEST_BUDGET");
+    assert.deepEqual(result.context?.plan?.unresolvedFields, []);
+  } finally {
+    GovernorManager.clearEvaluationCacheForTests();
+    for (const key of Object.keys(process.env)) {
+      if (!(key in oldEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, oldEnv);
+  }
+});
+
 test("runtime-resolvable availability may be unknown, but factual hard guard failure blocks", () => {
   assert.equal(assessActiveCanary(plan(), "id", { enabled: true, rate: 1 }).eligible, true);
   assert.equal(
@@ -272,7 +328,24 @@ test("real active runtime acquires the half-open probe only for governed B dispa
   try {
     const first = await applyGovernorToAutoComboOrder(input);
     assert.equal(first.applied, true);
+    assert.equal(first.context?.activeSelected, true);
+    assert.equal(first.context?.activeApplied, true);
+    assert.equal(first.context?.originalRoute.provider, "openai");
+    assert.equal(first.context?.originalRoute.model, "gpt-4o");
+    assert.equal(first.context?.selectedRoute?.provider, "openai");
+    assert.equal(first.context?.selectedRoute?.model, "o3-mini");
+    assert.equal(first.context?.bypassReason, undefined);
+    assert.equal(first.context?.selectedDispatchCount, 0);
+    assert.equal(first.context?.fallbackDispatchCount, 0);
+    assert.equal(first.context?.fallbackAttempted, false);
+    assert.equal(first.context?.fallbackSucceeded, false);
     assert.equal(first.orderedTargets[0].executionKey, "b");
+    assert.equal(first.selectedExecutionKey, "b");
+    assert.deepEqual(
+      first.orderedTargets.map((target) => target.executionKey),
+      ["b", "a"]
+    );
+    assert.equal(new Set(first.orderedTargets.map((target) => target.executionKey)).size, 2);
     assert.equal(breaker.isHalfOpenProbeInFlight(), true);
     assert.deepEqual(first.requestOverrides, {
       reasoning_effort: "medium",

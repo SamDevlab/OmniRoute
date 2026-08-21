@@ -20,6 +20,7 @@ const {
   safeLogEvents,
   withSessionHeader,
 } = await import("../../src/sse/handlers/chatHelpers.ts");
+const { getInternalRawErrorMessage } = await import("../../open-sse/utils/error.ts");
 const { getCircuitBreaker, resetAllCircuitBreakers, STATE } =
   await import("../../src/shared/utils/circuitBreaker.ts");
 // DATA_DIR must be fixed before these modules load; keep this test seam dynamic.
@@ -303,6 +304,32 @@ test("handleNoCredentials returns Retry-After when every account is rate limited
   assert.equal(response.status, 429);
   assert.ok(Number(response.headers.get("Retry-After")) >= 1);
   assert.match(json.error.message, /\[openai\/gpt-4o-mini\] Quota exceeded/);
+});
+
+test("handleNoCredentials keeps provider quota markers internal for combo classification", async () => {
+  const rawMessage =
+    "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day";
+  const response = handleNoCredentials(
+    {
+      allRateLimited: true,
+      retryAfter: new Date(Date.now() + 1_000).toISOString(),
+      retryAfterHuman: "reset after 1s",
+      cooldownScope: "model",
+      cooldownModel: "nvidia/nemotron-3.5-content-safety:free",
+      lastErrorCode: 429,
+      lastError: rawMessage,
+    },
+    "conn_123",
+    "openrouter",
+    "nvidia/nemotron-3.5-content-safety:free",
+    rawMessage,
+    429
+  );
+  const json = (await response.clone().json()) as any;
+
+  assert.equal(response.status, 429);
+  assert.equal(getInternalRawErrorMessage(response), rawMessage);
+  assert.doesNotMatch(JSON.stringify(json), /free-models-per-day/);
 });
 
 test("handleNoCredentials returns structured model_cooldown when every credential for the model is cooling down", async () => {

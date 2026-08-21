@@ -19,17 +19,31 @@ interface FetchTimeoutOptions extends RequestInit {
 }
 
 export async function fetchWithTimeout(url: string | URL, options: FetchTimeoutOptions = {}) {
-  const { timeoutMs = FETCH_TIMEOUT_MS, signal: externalSignal, fetchFn, ...fetchOptions } = options;
+  const {
+    timeoutMs = FETCH_TIMEOUT_MS,
+    signal: externalSignal,
+    fetchFn,
+    ...fetchOptions
+  } = options;
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  let externallyAborted = false;
+  const onExternalAbort = () => {
+    externallyAborted = true;
+    controller.abort(externalSignal?.reason);
+  };
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
 
   // If an external signal was provided, wire it to abort our controller too
   if (externalSignal) {
     if (externalSignal.aborted) {
-      controller.abort();
+      onExternalAbort();
     } else {
-      externalSignal.addEventListener("abort", () => controller.abort(), { once: true });
+      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
     }
   }
 
@@ -41,7 +55,7 @@ export async function fetchWithTimeout(url: string | URL, options: FetchTimeoutO
     });
     return response;
   } catch (error: any) {
-    if (error.name === "AbortError") {
+    if (error?.name === "AbortError" && timedOut && !externallyAborted) {
       throw new FetchTimeoutError(
         `Request to ${url} timed out after ${timeoutMs}ms`,
         timeoutMs,
@@ -51,6 +65,7 @@ export async function fetchWithTimeout(url: string | URL, options: FetchTimeoutO
     throw error;
   } finally {
     clearTimeout(timeoutId);
+    if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
   }
 }
 

@@ -146,12 +146,17 @@ function isProviderQuotaExhausted(
   >
 ): boolean {
   const { rawModel, fallbackResult, structuredError, errorText, allAccountsRateLimited } = opts;
+  const explicitProviderWideQuota =
+    fallbackResult?.creditsExhausted === true ||
+    fallbackResult?.dailyQuotaExhausted === true ||
+    allAccountsRateLimited;
   return (
     Boolean(provider && provider !== "unknown") &&
-    !hasPerModelQuota(provider as string, rawModel) &&
-    (isProviderExhaustedReason(fallbackResult) ||
-      classifyErrorText(structuredError?.code || errorText) === RateLimitReason.QUOTA_EXHAUSTED ||
-      allAccountsRateLimited)
+    (explicitProviderWideQuota ||
+      (!hasPerModelQuota(provider as string, rawModel) &&
+        (isProviderExhaustedReason(fallbackResult) ||
+          classifyErrorText(structuredError?.code || errorText) ===
+            RateLimitReason.QUOTA_EXHAUSTED)))
   );
 }
 

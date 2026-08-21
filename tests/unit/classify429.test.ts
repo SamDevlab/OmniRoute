@@ -36,6 +36,13 @@ test("classify429: 429 with quota keyword in string body returns 'quota_exhauste
   assert.equal(classify429({ status: 429, body: "plan limit reached" }), "quota_exhausted");
 });
 
+test("classify429: OpenRouter free-model daily quota is not a transient rate limit", () => {
+  const body =
+    "[429]: Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day";
+  assert.equal(looksLikeQuotaExhausted(body), true);
+  assert.equal(classify429({ status: 429, body }), "quota_exhausted");
+});
+
 test("classify429: Antigravity 'Individual quota reached' body returns 'quota_exhausted'", () => {
   const body =
     "Individual quota reached. Contact your administrator to enable overages. " +

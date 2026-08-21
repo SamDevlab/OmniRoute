@@ -1,4 +1,8 @@
-import { errorResponse, unavailableResponse, errorResponseWithComboDiagnostics } from "../../utils/error.ts";
+import {
+  errorResponse,
+  unavailableResponse,
+  errorResponseWithComboDiagnostics,
+} from "../../utils/error.ts";
 import { BudgetExceededError, selectProvider as selectAutoProvider } from "../autoCombo/engine.ts";
 import {
   resolveRequestModePack,
@@ -122,8 +126,7 @@ export async function resolveAutoStrategyOrder(
     // registry/capability rows honestly report toolCalling:false.
     const filtered = eligibleTargets.filter(
       (target) =>
-        supportsToolCalling(target.modelStr) ||
-        providerSupportsEmulatedToolCalling(target.provider)
+        supportsToolCalling(target.modelStr) || providerSupportsEmulatedToolCalling(target.provider)
     );
     if (filtered.length > 0) {
       eligibleTargets = filtered;
@@ -456,14 +459,18 @@ export async function resolveAutoStrategyOrder(
           (target) => target.executionKey === governed.selectedExecutionKey
         );
         if (selectedRuntimeTarget) {
-          (selectedRuntimeTarget as ResolvedComboTarget & {
-            governorSelected?: boolean;
-            governorCorrelationId?: string | null;
-          }).governorSelected = governed.applied;
-          (selectedRuntimeTarget as ResolvedComboTarget & {
-            governorSelected?: boolean;
-            governorCorrelationId?: string | null;
-          }).governorCorrelationId = correlationId ?? null;
+          (
+            selectedRuntimeTarget as ResolvedComboTarget & {
+              governorSelected?: boolean;
+              governorCorrelationId?: string | null;
+            }
+          ).governorSelected = governed.applied;
+          (
+            selectedRuntimeTarget as ResolvedComboTarget & {
+              governorSelected?: boolean;
+              governorCorrelationId?: string | null;
+            }
+          ).governorCorrelationId = correlationId ?? null;
           selectedRuntimeTarget.governorRequestOverrides = governed.requestOverrides
             ? { ...governed.requestOverrides }
             : undefined;
