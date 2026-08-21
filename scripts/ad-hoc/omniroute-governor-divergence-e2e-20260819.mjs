@@ -1813,6 +1813,11 @@ function appendPairCompleteOperation(run, pair, input, authoritative) {
     baselineVsFinalActual: pair.baselineVsFinalActual || null,
     baselineDrift: pair.baselineDrift || null,
     nativeFallback: pair.nativeFallback || null,
+    nativeTargetIdentity: pair.native?.targetIdentity || null,
+    baselineSnapshotId:
+      pair.native?.baselineSnapshotId || pair.baseline?.baselineSnapshotId || null,
+    baselineSnapshotHash:
+      pair.native?.baselineSnapshotHash || pair.baseline?.baselineSnapshotHash || null,
     governorPlanExecutable:
       pair.governor?.planState?.executable === true || pair.governor?.plan?.executable === true,
     governorTargetIdentity: pair.governor?.targetIdentity || null,

@@ -485,7 +485,26 @@ function uniqueValues(values) {
 export function deriveFivePairGate(pairs, { requestedPairs = null, artifactWarnings = [] } = {}) {
   const firstFive = Array.isArray(pairs) ? pairs.slice(0, 5) : [];
   const pairsStarted = new Set(firstFive.map((pair) => pair.pairId).filter(Boolean)).size;
-  const failureClasses = [...new Set(firstFive.map((pair) => pair.failureClass).filter(Boolean))];
+  const failureClasses = [
+    ...new Set(
+      firstFive.flatMap((pair) => [
+        pair.failureClass,
+        pair.baselineDrift === true ? "TARGET_MISMATCH" : null,
+      ])
+    ),
+  ].filter(Boolean);
+  const nativeIdentity = (pair) => {
+    if (pair.nativeTargetIdentity === "PASS") return "PASS";
+    if (pair.nativeTargetIdentity) return pair.nativeTargetIdentity;
+    if (
+      pair.baselineVsFirstActual === "PASS" &&
+      pair.baselineDrift !== true &&
+      pair.failureClass !== "TARGET_MISMATCH"
+    ) {
+      return "PASS";
+    }
+    return "UNKNOWN";
+  };
   const qualityPass = firstFive.every(
     (pair) => pair.nativeQualityPass === true && pair.governorQualityPass === true
   );
@@ -494,7 +513,10 @@ export function deriveFivePairGate(pairs, { requestedPairs = null, artifactWarni
     (pair) =>
       ["HARNESS_FAILURE", "TARGET_MISMATCH", "ARTIFACT_CORRUPTION", "METHODOLOGY_FAILURE"].includes(
         pair.failureClass
-      ) || pair.stopBenchmark === true
+      ) ||
+      pair.baselineDrift === true ||
+      nativeIdentity(pair) === "MISMATCH" ||
+      pair.stopBenchmark === true
   );
   const pass =
     firstFive.length === 5 &&
@@ -506,6 +528,8 @@ export function deriveFivePairGate(pairs, { requestedPairs = null, artifactWarni
         pair.nativeStreamCompleted === true &&
         pair.governorStreamCompleted === true &&
         pair.governorPlanExecutable === true &&
+        nativeIdentity(pair) === "PASS" &&
+        pair.baselineDrift !== true &&
         pair.governorTargetIdentity === "PASS" &&
         pair.nativeQualityPass === true &&
         pair.governorQualityPass === true
@@ -528,7 +552,15 @@ export function deriveFivePairGate(pairs, { requestedPairs = null, artifactWarni
     nativeQuality: firstFive.filter((pair) => pair.nativeQualityPass === true).length,
     governorQuality: firstFive.filter((pair) => pair.governorQualityPass === true).length,
     quality: qualityPass ? "PASS" : "FAIL",
-    identity: firstFive.every((pair) => pair.governorTargetIdentity === "PASS") ? "PASS" : "FAIL",
+    nativeIdentity: firstFive.every((pair) => nativeIdentity(pair) === "PASS") ? "PASS" : "FAIL",
+    governorIdentity: firstFive.every((pair) => pair.governorTargetIdentity === "PASS")
+      ? "PASS"
+      : "FAIL",
+    identity: firstFive.every(
+      (pair) => nativeIdentity(pair) === "PASS" && pair.governorTargetIdentity === "PASS"
+    )
+      ? "PASS"
+      : "FAIL",
     accounting: firstFive.every(
       (pair) =>
         pair.nativeOperationId && pair.governorPlanOperationId && pair.governorArmOperationId

@@ -104,6 +104,9 @@ function validPairRecord(pairNumber) {
     governorPlanOperationId: `plan-${pairId}`,
     governorArmOperationId: `arm-${pairId}`,
     governorPlanExecutable: true,
+    nativeTargetIdentity: "PASS",
+    baselineVsFirstActual: "PASS",
+    baselineDrift: false,
     governorTargetIdentity: "PASS",
     nativeHttp: 200,
     governorHttp: 200,
@@ -296,6 +299,52 @@ test("five-pair gate safely distinguishes valid, non-executable, and harness-inv
   const harnessGate = deriveFivePairGate(harnessFailure, { requestedPairs: 5 });
   assert.equal(harnessGate.pass, false);
   assert.equal(harnessGate.benchmarkInvalid, true);
+});
+
+test("offline identity gate requires Native identity and rejects baseline drift", () => {
+  const valid = Array.from({ length: 5 }, (_, index) => validPairRecord(index + 1));
+  const governorOnly = valid.map((pair) => ({
+    ...pair,
+    nativeTargetIdentity: undefined,
+    baselineVsFirstActual: undefined,
+    baselineDrift: undefined,
+  }));
+  const governorOnlyGate = deriveFivePairGate(governorOnly, { requestedPairs: 5 });
+  assert.equal(governorOnlyGate.identity, "FAIL");
+  assert.equal(governorOnlyGate.nativeIdentity, "FAIL");
+  assert.equal(governorOnlyGate.pass, false);
+
+  const drift = valid.map((pair, index) =>
+    index === 1
+      ? {
+          ...pair,
+          nativeTargetIdentity: "MISMATCH",
+          baselineVsFirstActual: "MISMATCH",
+          baselineDrift: true,
+          failureClass: "MODEL_QUALITY_FAILURE",
+        }
+      : pair
+  );
+  const driftGate = deriveFivePairGate(drift, { requestedPairs: 5 });
+  assert.equal(driftGate.identity, "FAIL");
+  assert.equal(driftGate.benchmarkInvalid, true);
+  assert.deepEqual(driftGate.failureClasses.sort(), ["MODEL_QUALITY_FAILURE", "TARGET_MISMATCH"]);
+  assert.equal(driftGate.pass, false);
+});
+
+test("model quality failure remains experimental when both identities pass", () => {
+  const pairs = Array.from({ length: 5 }, (_, index) => ({
+    ...validPairRecord(index + 1),
+    nativeQualityPass: index === 0,
+    governorQualityPass: index === 0,
+    failureClass: index === 0 ? null : "MODEL_QUALITY_FAILURE",
+  }));
+  const gate = deriveFivePairGate(pairs, { requestedPairs: 5 });
+  assert.equal(gate.nativeIdentity, "PASS");
+  assert.equal(gate.governorIdentity, "PASS");
+  assert.equal(gate.identity, "PASS");
+  assert.equal(gate.benchmarkInvalid, false);
+  assert.equal(gate.quality, "FAIL");
 });
 
 test("offline summary persists and reads an invalid pair with no Governor arm", () => {
