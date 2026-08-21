@@ -164,3 +164,40 @@ The harness now rejects unsupported arguments before pool/request work, and excl
 the virtual `auto/chat` aggregate row from physical call-log identity evidence. The
 historical runs `20260821T001612Z-c9ef5d19` and `20260821T022100Z-27ab5601` remain
 invalid and must not be resumed.
+
+## Clean authoritative run — production-path parity proven
+
+Validation used HEAD `e06d7a1aa8e1c508d4d0092fd6741a8f0f33862e`, equal locally and
+on origin, with one Turbopack runtime. Effective Governor state was
+`simulate / false / 0`, telemetry was enabled, and canary remained `0`. The
+required CI checks were green or expected advisory skips.
+
+Readiness passed 10/10 for native baselines, canonical identities, plans,
+guardrails, and executable plans. The production-path parity probe passed 10/10
+through real `handleComboChat` with an injected `handleSingleModel` interceptor;
+it observed zero network/provider calls before interception and prevented physical
+dispatch. The physical high-water marker stayed unchanged through both preflight
+phases.
+
+New authoritative run: `20260821T102320Z-2faf68e8`. Durable artifacts are in
+`docs/diagnostics/governor-e2e-artifacts/20260821T102320Z-2faf68e8/`. The run
+stopped after pair 1 of the requested 5 and was not expanded to 10. The manifest
+records `BENCHMARK_INVALID`, `TARGET_MISMATCH`, and `NATIVE_BASELINE_DRIFT`.
+Native baseline was `opencode/mimo-v2.5-free`; first actual was
+`opencode/big-pickle`; final actual was `felo-web/felo-document`. Native fallback
+was true, so Native identity failed. Governor planning was included in E2E; its
+executable target was `opencode/hy3-free`, with 38 ms planning and 3890 ms total
+E2E. Governor quality/HTTP/stream passed for the single arm; Native quality and
+stream failed. No winner is declared.
+
+The persisted five-pair gate is false: 1 pair started/completed, 0 valid, Native
+identity failed, Governor identity passed, accounting passed, and artifact
+integrity passed. Artifact accounting records 2 authoritative physical requests
+(1 Native arm and 1 Governor execution). The external call log records 9 new rows;
+8 are virtual `auto/chat` fallback rows excluded by the physical-marker rule.
+
+The official offline `--summarize-run` replay matches `summary.json` for status,
+pair counts, gate, identity, failure classes, quality, HTTP, stream, accounting,
+E2E, planning, and target distributions, with zero warnings. No pricing result is
+claimed. `DECISION_BENCHMARK: INCONCLUSIVE`. The invalid run is preserved and was
+not rerun, resumed, or patched; strict validators remain unchanged.
