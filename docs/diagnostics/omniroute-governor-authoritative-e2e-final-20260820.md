@@ -78,3 +78,52 @@ the five-pair gate did not complete, no E2E winner is declared.
 
 The Governor's E2E advantage cannot be determined from this invalid, incomplete run.
 Cost remains incomplete. Active mode and canary were not enabled.
+
+## Final authoritative rerun after replay fix
+
+The exact CI-validated HEAD was `0a3035b3a7ea9e98cbc1c59ac8dd7302cdd85b44`.
+Required checks were successful: Quality Gates, Governor Harness, Semgrep, DAST
+smoke, and Fast Production Build. The expected advisory build skip was not treated
+as a failure. Runtime used Turbopack; `/api/monitoring/health` returned HTTP 200 in
+2340 ms. Effective Governor state was `simulate / false / 0`, telemetry enabled,
+and canary `0`.
+
+The official readiness gate passed with pool raw/active/eligible/healthy `11/11/11/11`,
+10/10 plans, 10/10 guardrails, 10/10 executable plans, zero provider/model requests,
+and `PREFLIGHT_STATE_CONTAMINATION=NO`.
+
+New authoritative run: `20260821T022100Z-27ab5601`.
+
+Artifacts were read from the durable `manifest.json`, `operations.jsonl`, and
+`summary.json` files at:
+
+`docs/diagnostics/governor-e2e-artifacts/20260821T022100Z-27ab5601/`
+
+The run stopped after pair 1, before pairs 2–10, because the Native first actual
+target was `opencode/deepseek-v4-flash-free` while the side-effect-free Native
+baseline was `opencode/big-pickle`; the request then fell back to `auto/chat`.
+The artifact records `baselineDrift=true`, `stopReason=BENCHMARK_INVALID`,
+`failureClass=TARGET_MISMATCH`, and `failureReason=NATIVE_BASELINE_DRIFT`.
+The baseline snapshot had zero provider/model requests, zero network calls, no
+routing-state mutation, and identical before/after home-state digests.
+
+The five-pair gate failed with 1 started/completed pair, 0 valid pairs, Native
+identity `FAIL`, Governor identity `PASS`, accounting `PASS`, artifact integrity
+`PASS`, and `benchmarkInvalid=true`. No further physical requests were issued.
+Governor planning was included in E2E accounting (`81 ms` planning; Governor E2E
+`6665 ms`), but no winner is declared because the benchmark was structurally invalid.
+Strict validators remain unchanged; no Markdown fences or validator relaxation was
+introduced.
+
+The required `--summarize-run` replay produced the same run status, pair counts,
+five-pair gate, identity results, accounting, quality counts, E2E timings, planning
+timings, and target distributions as the persisted execution summary, with zero
+warnings. This confirms the offline summary is consistent with the authoritative
+artifacts.
+
+`DECISION_BENCHMARK: INCONCLUSIVE`
+
+The Governor's E2E advantage remains undetermined: the new run exposed a real Native
+baseline/first-actual routing mismatch before a valid Native-vs-Governor comparison
+could be completed. The historical invalid run remains historical only; it was not
+resumed or reused.
