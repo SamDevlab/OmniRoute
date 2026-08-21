@@ -101,11 +101,14 @@ Artifacts were read from the durable `manifest.json`, `operations.jsonl`, and
 
 The run stopped after pair 1, before pairs 2–10, because the Native first actual
 target was `opencode/deepseek-v4-flash-free` while the side-effect-free Native
-baseline was `opencode/big-pickle`; the request then fell back to `auto/chat`.
+baseline was `opencode/big-pickle`.
 The artifact records `baselineDrift=true`, `stopReason=BENCHMARK_INVALID`,
 `failureClass=TARGET_MISMATCH`, and `failureReason=NATIVE_BASELINE_DRIFT`.
 The baseline snapshot had zero provider/model requests, zero network calls, no
 routing-state mutation, and identical before/after home-state digests.
+The physical call-log sequence for Pair 1 began with
+`opencode/deepseek-v4-flash-free` and then tried Felo targets; its `auto/chat` row
+was only the virtual aggregate error row. `DID_PHYSICAL_FALLBACK_TO_AUTO_CHAT=NO`.
 
 The five-pair gate failed with 1 started/completed pair, 0 valid pairs, Native
 identity `FAIL`, Governor identity `PASS`, accounting `PASS`, artifact integrity
@@ -123,7 +126,41 @@ artifacts.
 
 `DECISION_BENCHMARK: INCONCLUSIVE`
 
-The Governor's E2E advantage remains undetermined: the new run exposed a real Native
+The Governor's E2E advantage remains undetermined: the new run exposed a Native
 baseline/first-actual routing mismatch before a valid Native-vs-Governor comparison
 could be completed. The historical invalid run remains historical only; it was not
 resumed or reused.
+
+## Root-cause diagnosis after the invalid rerun
+
+The apparent LKGP explanation was tested without model requests. The production
+LKGP for `auto/chat` was present as provider metadata `opencode`; the isolated worker
+saw no LKGP. With the frozen Pair 1 snapshot, both resolutions selected the same
+first target:
+
+| Resolution              | First target          | Network/provider-model requests |
+| ----------------------- | --------------------- | ------------------------------: |
+| Without LKGP            | `opencode/big-pickle` |                           0 / 0 |
+| With real LKGP metadata | `opencode/big-pickle` |                           0 / 0 |
+
+Therefore `LKGP_PARITY_ROOT_CAUSE=NOT_CONFIRMED`.
+
+The decisive evidence is temporal contamination before and during the run. The
+unsupported diagnostic command `--help` was not recognized by the old harness and
+fell through to the non-authoritative execution path while the Turbopack runtime was
+active. The household call log contains 44 physical rows from `02:20:11` through
+`02:20:59`, immediately before the authoritative run began at `02:21:00`; those
+requests changed live provider/model resilience state. The Pair 1 request then began
+at `02:21:48`, after that untracked activity. The frozen baseline could not observe
+this live-state transition, so the result is not evidence of clean production-vs-
+baseline routing parity.
+
+Root cause classification: `OTHER_ROUTING_INPUT_PARITY_BUG` in the benchmark
+precondition/harness, specifically unguarded unsupported CLI input plus live-state
+contamination between snapshot and dispatch. Production routing semantics were not
+changed.
+
+The harness now rejects unsupported arguments before pool/request work, and excludes
+the virtual `auto/chat` aggregate row from physical call-log identity evidence. The
+historical runs `20260821T001612Z-c9ef5d19` and `20260821T022100Z-27ab5601` remain
+invalid and must not be resumed.

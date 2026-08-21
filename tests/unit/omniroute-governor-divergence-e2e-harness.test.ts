@@ -600,3 +600,24 @@ test("calibration accounting keeps three pairs and six E2E arm requests explicit
   assert.equal(accounting.nativeAutoRequests, 3);
   assert.equal(accounting.governorDirectRequests, 3);
 });
+
+test("harness rejects unsupported CLI arguments before any pool or request work", () => {
+  const guardStart = harnessSource.indexOf("const supportedCliFlags");
+  const poolStart = harnessSource.indexOf("const pool = await buildPool()");
+  assert.ok(guardStart >= 0);
+  assert.ok(poolStart > guardStart);
+  const guardSource = harnessSource.slice(guardStart, poolStart);
+  assert.match(guardSource, /unknownCliArgs/);
+  assert.match(guardSource, /unknownCliArgs\.includes\("--help"\)/);
+  assert.match(guardSource, /process\.exit\(2\)/);
+});
+
+test("native call-log evidence excludes the virtual auto/chat summary row", () => {
+  const start = harnessSource.indexOf("async function readCallLogIdentity");
+  const end = harnessSource.indexOf("async function readStreamingBody", start);
+  assert.ok(start >= 0 && end > start);
+  const source = harnessSource.slice(start, end);
+  assert.match(source, /entry\.provider !== "auto"/);
+  assert.match(source, /entry\.model !== "auto\/chat"/);
+  assert.match(source, /entry\.requestedModel !== "auto\/chat"/);
+});

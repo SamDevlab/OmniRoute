@@ -67,6 +67,35 @@ const requestedPairs = Number(
   process.argv.find((arg) => arg.startsWith("--pairs="))?.split("=")[1] || 10
 );
 
+const supportedCliFlags = new Set([
+  "--pool-only",
+  "--workload-only",
+  "--e2e-only",
+  "--direct-only",
+  "--replay-only",
+  "--e2e-replay",
+  "--calibration-recovery",
+  "--authoritative-e2e",
+]);
+const unknownCliArgs = process.argv.slice(2).filter((arg) => {
+  if (supportedCliFlags.has(arg)) return false;
+  return !/^--pairs=\d+$/.test(arg);
+});
+if (unknownCliArgs.includes("--help")) {
+  console.log(
+    [
+      "Usage: node scripts/ad-hoc/omniroute-governor-divergence-e2e-20260819.mjs [flags]",
+      "Flags: --authoritative-e2e --pairs=5|10 --pool-only --workload-only",
+      "       --e2e-only --direct-only --replay-only --e2e-replay --calibration-recovery",
+    ].join("\n")
+  );
+  process.exit(0);
+}
+if (unknownCliArgs.length > 0) {
+  console.error(`[HARNESS] Unsupported argument(s): ${unknownCliArgs.join(", ")}`);
+  process.exit(2);
+}
+
 let activeBenchmarkRun = null;
 let signalHandlersInstalled = false;
 let activeBenchmarkSignalHandler = null;
@@ -471,7 +500,11 @@ async function readCallLogIdentity(correlationIds) {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     for (const correlationId of ids) {
       const row = (await getCallLogs({ correlationId, limit: 5 })).find(
-        (entry) => entry.correlationId === correlationId
+        (entry) =>
+          entry.correlationId === correlationId &&
+          entry.provider !== "auto" &&
+          entry.model !== "auto/chat" &&
+          entry.requestedModel !== "auto/chat"
       );
       if (row) {
         return {
